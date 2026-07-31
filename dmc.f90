@@ -14,12 +14,14 @@ program qmc
 
   type walkers_t
      integer               :: n
-     integer               :: n_max
-     integer               :: n_target
      integer               :: ndim
      integer               :: branch_limit
-     integer, allocatable  :: w(:)
+     real(dp)              :: n_eff_frac = 0.8_dp
+     real(dp), allocatable :: w(:)
      real(dp), allocatable :: x(:, :)
+     real(dp), allocatable :: phi(:)
+     ! For updating population
+     real(dp), allocatable :: x_new(:, :), phi_new(:), cdf(:)
   end type walkers_t
 
   type(cfg_t)           :: cfg
@@ -31,7 +33,7 @@ program qmc
   real(dp)              :: mean_local_energy
   real(dp), allocatable :: mean_local_energy_array(:)
   real(dp)              :: ratio, kappa
-  real(dp), allocatable :: potential(:, :)
+  real(dp)              :: sum_w, n_eff
 
   integer  :: batch_size, trunc_obs, status
   real(dp) :: min_mser
@@ -47,10 +49,8 @@ program qmc
        "Time step (atomic units)")
   call cfg_add(cfg, "end_time", 20.0_dp, &
        "End time (atomic units)")
-  call cfg_add(cfg, "num_walkers_target", 100000, &
+  call cfg_add(cfg, "num_walkers", 100000, &
        "Target number of walkers")
-  call cfg_add(cfg, "max_walkers_ratio", 4.0_dp, &
-       "Maximum ratio of num_walkers/num_walkers_target")
   call cfg_add(cfg, "walkers_branch_limit", 3, &
        "Maximum branching ratio (number of copies) per walker")
   call cfg_add(cfg, "initial_energy", 0.0_dp, &
@@ -76,7 +76,6 @@ program qmc
 
   call walkers_initialize(cfg, walkers)
 
-  allocate(potential(walkers%n_max, 2))
   allocate(mean_local_energy_array(max_steps))
 
   time = 0.0_dp
@@ -84,16 +83,12 @@ program qmc
   mean_local_energy = 0.0_dp
 
   do n_steps = 1, max_steps
-     ! Compute potential at current position
-     call compute_potential(walkers, potential(:, 1))
+     call walkers_update(walkers, dt, trial_energy, &
+          mean_local_energy_array(n_steps), sum_w, n_eff)
 
-     call walkers_diffuse(walkers, dt)
-
-     ! Compute potential at new position
-     call compute_potential(walkers, potential(:, 2))
-
-     call walkers_branch(walkers, dt, potential, trial_energy, &
-          mean_local_energy_array(n_steps))
+     if (n_eff < walkers%n_eff_frac * walkers%n) then
+        call systematic_resample(walkers, rng, sum_w)
+     end if
 
      if (mod(n_steps, max_steps/100) == 0) then
         call mser_analysis(n_steps, mean_local_energy_array, batch_size, &
@@ -102,12 +97,11 @@ program qmc
      end if
 
      time = time + dt
-
-     ratio = walkers%n / real(walkers%n_target, dp)
+     ratio = sum_w / walkers%n
      trial_energy = mean_local_energy - 1/(kappa*dt) * log(ratio)
   end do
 
-  write(*, "(A,E12.4)") "Total updates: ", n_steps * real(walkers%n_target, dp)
+  write(*, "(A,E12.4)") "Total updates: ", n_steps * real(walkers%n, dp)
 
 contains
 
@@ -116,17 +110,18 @@ contains
     type(walkers_t), intent(inout) :: walkers
     character(len=20)              :: initial_distribution
     integer                        :: i, idim
-    real(dp)                       :: max_walkers_ratio
 
-    call cfg_get(cfg, "num_walkers_target", walkers%n_target)
-    call cfg_get(cfg, "max_walkers_ratio", max_walkers_ratio)
+    call cfg_get(cfg, "num_walkers", walkers%n)
     call cfg_get(cfg, "ndim", walkers%ndim)
     call cfg_get(cfg, "walkers_branch_limit", walkers%branch_limit)
 
-    walkers%n = walkers%n_target
-    walkers%n_max = ceiling(max_walkers_ratio * walkers%n_target)
-    allocate(walkers%w(walkers%n_max))
-    allocate(walkers%x(walkers%ndim, walkers%n_max))
+    allocate(walkers%w(walkers%n))
+    allocate(walkers%x(walkers%ndim, walkers%n))
+    allocate(walkers%phi(walkers%n))
+
+    allocate(walkers%x_new(walkers%ndim, walkers%n))
+    allocate(walkers%phi_new(walkers%n))
+    allocate(walkers%cdf(walkers%n))
 
     call cfg_get(cfg, "initial_distribution", initial_distribution)
 
@@ -141,146 +136,109 @@ contains
        error stop "Invalid initial_distribution. Options: uniform"
     end select
 
+    ! Compute initial potential and set weight
+    do i = 1, walkers%n
+       call compute_potential(walkers, i)
+       walkers%w(i) = 1.0_dp
+    end do
+
   end subroutine walkers_initialize
 
-  subroutine walkers_diffuse(walkers, dt)
+  subroutine walkers_update(walkers, dt, trial_energy, local_energy, &
+       sum_w, n_eff)
     type(walkers_t), intent(inout) :: walkers
-    real(dp), intent(in)           :: dt
+    real(dp), intent(in)           :: dt, trial_energy
+    real(dp), intent(out)          :: local_energy
+    real(dp), intent(out)          :: sum_w
+    real(dp), intent(out)          :: n_eff
     integer                        :: i, idim
-    real(dp)                       :: sqrt_dt
+    real(dp)                       :: phi_old, phi_avg, sqrt_dt
+    real(dp)                       :: sum_w2, sum_we
 
     sqrt_dt = sqrt(dt)
+    sum_w  = 0.0_dp
+    sum_we = 0.0_dp
+    sum_w2 = 0.0_dp
+
     do i = 1, walkers%n
+       phi_old = walkers%phi(i)
        do idim = 1, walkers%ndim
-          ! Note: rng%normal() is not thread-safe
           walkers%x(idim, i) = walkers%x(idim, i) + sqrt_dt * rng%normal()
        end do
-    end do
-  end subroutine walkers_diffuse
+       call compute_potential(walkers, i)
+       phi_avg = 0.5_dp * (walkers%phi(i) + phi_old)
 
-  subroutine walkers_branch(walkers, dt, potential, trial_energy, local_energy)
+       walkers%w(i) = walkers%w(i) * &
+            exp(-dt * (phi_avg - trial_energy))
+
+       sum_w  = sum_w  + walkers%w(i)
+       sum_we = sum_we + walkers%w(i) * phi_avg
+       sum_w2 = sum_w2 + walkers%w(i)**2
+    end do
+
+    local_energy = sum_we / sum_w
+    n_eff = sum_w**2 / sum_w2
+  end subroutine walkers_update
+
+  subroutine systematic_resample(walkers, rng, sum_w)
     type(walkers_t), intent(inout) :: walkers
-    real(dp), intent(in)           :: dt
-    real(dp), intent(in)           :: potential(walkers%n_max, 2)
-    real(dp), intent(in)           :: trial_energy
-    real(dp), intent(out)          :: local_energy
-    integer                        :: i, j, n_old, ix_tail
-    real(dp)                       :: phi, w, exp_arg
+    type(rng_t), intent(inout)     :: rng
+    real(dp), intent(in)           :: sum_w
+    integer                        :: i, j, n
+    real(dp)                       :: u0, step, mean_w, pos
 
-    ! First pass: compute weights
-    local_energy = 0.0_dp
-    n_old = walkers%n
-    do i = 1, n_old
-       phi = 0.5_dp * (potential(i, 1) + potential(i, 2))
-       exp_arg = min(-dt * (phi - trial_energy), 20.0_dp)
-       w = exp(exp_arg) + rng%unif_01()
-       walkers%w(i) = min(int(w), walkers%branch_limit)
-       local_energy = local_energy + phi
-    end do
+    n = walkers%n
 
-    local_energy = local_energy / n_old
+    associate (cdf => walkers%cdf, x_new => walkers%x_new, phi_new => walkers%phi_new)
+      cdf(1) = walkers%w(1)
+      do i = 2, n
+         cdf(i) = cdf(i-1) + walkers%w(i)
+      end do
 
-    ! Place extra copies (w > 1) at the tail
-    ix_tail = n_old
-    do i = 1, n_old
-       do j = 2, walkers%w(i)  ! only extra copies
-          ix_tail = ix_tail + 1
-          walkers%x(:, ix_tail) = walkers%x(:, i)
-          walkers%w(ix_tail) = 1  ! mark copies as valid
-       end do
-    end do
+      step = sum_w / n
+      u0   = rng%unif_01() * step        ! single random offset
 
-    ! Compact: remove walkers with w=0 by swapping from tail
-    i = 1
-    do while (i <= ix_tail)
-       if (walkers%w(i) == 0) then
-          ! Skip tail walkers that are also dead
-          do while (ix_tail > i .and. walkers%w(ix_tail) == 0)
-             ix_tail = ix_tail - 1
-          end do
-          if (i >= ix_tail) then
-             ix_tail = i - 1
-             exit
-          end if
-          walkers%x(:, i) = walkers%x(:, ix_tail)
-          walkers%w(i) = 1
-          ix_tail = ix_tail - 1
+      ! --- gather step: fully parallel, each thread independent ---
+      !$acc data copyin(cdf, walkers%x, walkers%phi) &
+      !$acc      copyout(x_new, phi_new)
+      !$acc parallel loop private(pos, j)
+      do i = 1, n
+         pos = u0 + (i-1) * step
+         j   = upper_bound(cdf, pos)      ! first index with cdf(j) >= pos
+         x_new(:, i) = walkers%x(:, j)
+         phi_new(i)  = walkers%phi(j)     ! copy phi, do NOT recompute
+      end do
+
+      mean_w = sum_w / n
+      do i = 1, n
+         walkers%x(:, i) = x_new(:, i)
+         walkers%phi(i)  = phi_new(i)
+         walkers%w(i)    = mean_w
+      end do
+    end associate
+  end subroutine systematic_resample
+
+  pure integer function upper_bound(cdf, val) result(lo)
+    !$acc routine seq
+    real(dp), intent(in) :: cdf(:), val
+    integer :: hi, mid
+    lo = 1; hi = size(cdf)
+    do while (lo < hi)
+       mid = (lo + hi) / 2
+       if (cdf(mid) < val) then
+          lo = mid + 1
+       else
+          hi = mid
        end if
-       i = i + 1
     end do
+  end function upper_bound
 
-    walkers%n = ix_tail
-  end subroutine walkers_branch
+  subroutine compute_potential(walkers, i)
+    type(walkers_t), intent(inout) :: walkers
+    integer, intent(in)            :: i
 
-  ! subroutine walkers_branch(walkers, dt, potential, trial_energy, local_energy)
-  !   type(walkers_t), intent(inout) :: walkers
-  !   real(dp), intent(in)           :: dt
-  !   real(dp), intent(in)           :: potential(walkers%n_max, 2)
-  !   real(dp), intent(in)           :: trial_energy
-  !   real(dp), intent(out)          :: local_energy
-  !   integer                        :: i, j, n_old, n_new, offset
-  !   real(dp)                       :: phi, w, exp_arg
-  !   integer, allocatable           :: counts(:)   ! offspring count per walker
-  !   integer, allocatable           :: offsets(:)  ! exclusive prefix sum
-  !   real(dp), allocatable          :: x_new(:, :) ! destination buffer
-
-  !   n_old = walkers%n
-  !   allocate(counts(n_old), offsets(n_old))
-
-  !   ! -------- Pass 1: parallel MAP (weights + local energy) --------
-  !   ! Each iteration independent -> GPU: one thread per walker.
-  !   ! local_energy accumulation -> GPU: parallel REDUCTION.
-  !   local_energy = 0.0_dp
-  !   do i = 1, n_old
-  !      phi     = 0.5_dp * (potential(i, 1) + potential(i, 2))
-  !      exp_arg = min(-dt * (phi - trial_energy), 20.0_dp)
-  !      w       = exp(exp_arg) + rng%unif_01()   ! use per-walker RNG stream on GPU
-  !      counts(i) = min(int(w), walkers%branch_limit)
-  !      local_energy = local_energy + phi
-  !   end do
-  !   local_energy = local_energy / n_old
-
-  !   ! -------- Pass 2: exclusive SCAN (prefix sum of counts) --------
-  !   ! GPU: CUB/Thrust exclusive_scan. Serial reference below.
-  !   offset = 0
-  !   do i = 1, n_old
-  !      offsets(i) = offset          ! 0-based write position for walker i
-  !      offset     = offset + counts(i)
-  !   end do
-  !   n_new = offset                  ! total survivors = last offset + last count
-
-  !   if (n_new > walkers%n_max) then
-  !      error stop "walker overflow: increase max_walkers_ratio"
-  !   end if
-
-  !   ! -------- Pass 3: SCATTER (write offspring to contiguous slots) --------
-  !   ! Each source walker writes counts(i) copies into disjoint positions,
-  !   ! so writes never collide -> fully parallel.
-  !   ! Use a separate destination buffer (double-buffering) to avoid overlap.
-  !   allocate(x_new(walkers%ndim, n_new))
-  !   do i = 1, n_old
-  !      do j = 1, counts(i)
-  !         x_new(:, offsets(i) + j) = walkers%x(:, i)
-  !      end do
-  !   end do
-
-  !   ! -------- Commit new generation --------
-  !   walkers%x(:, 1:n_new) = x_new(:, 1:n_new)
-  !   walkers%w(1:n_new)    = 1
-  !   walkers%n             = n_new
-
-  !   deallocate(counts, offsets, x_new)
-  ! end subroutine walkers_branch
-
-  subroutine compute_potential(walkers, phi)
-    type(walkers_t), intent(in) :: walkers
-    real(dp), intent(out)       :: phi(walkers%n_max)
-    integer                     :: i
-
-    do i = 1, walkers%n
-       ! phi(i) = 0.5_dp * sum(walkers%x(:, i)**2)
-       phi(i) = -1.0_dp / norm2(walkers%x(:, i))
-    end do
+    ! walkers%phi(i) = 0.5_dp * sum(walkers%x(:, i)**2)
+    walkers%phi(i) = -1.0_dp / norm2(walkers%x(:, i))
   end subroutine compute_potential
 
 end program qmc

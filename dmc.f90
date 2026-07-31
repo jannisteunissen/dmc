@@ -3,25 +3,29 @@
 !
 ! Author: Jannis Teunissen
 program qmc
-  use iso_fortran_env, only: error_unit, real64
+  use iso_fortran_env, only: error_unit, real32, real64, int32, int64
   use m_config
   use m_random
   use m_mser
 
   implicit none
 
-  integer, parameter  :: dp = real64
+  integer, parameter :: dp = real64
+  integer, parameter :: sp = real32
 
   type walkers_t
      integer               :: n
      integer               :: ndim
-     integer               :: branch_limit
      real(dp)              :: n_eff_frac = 0.8_dp
-     real(dp), allocatable :: w(:)
-     real(dp), allocatable :: x(:, :)
-     real(dp), allocatable :: phi(:)
+     real(sp), allocatable :: w(:)
+     real(sp), allocatable :: x(:, :)
+     real(sp), allocatable :: phi(:)
      ! For updating population
-     real(dp), allocatable :: x_new(:, :), phi_new(:), cdf(:)
+     real(sp), allocatable :: x_new(:, :)
+     real(sp), allocatable :: phi_new(:)
+     real(dp), allocatable :: cdf(:)
+     ! Random seed state
+     integer(int64), allocatable :: s(:, :)
   end type walkers_t
 
   type(cfg_t)           :: cfg
@@ -51,8 +55,6 @@ program qmc
        "End time (atomic units)")
   call cfg_add(cfg, "num_walkers", 100000, &
        "Target number of walkers")
-  call cfg_add(cfg, "walkers_branch_limit", 3, &
-       "Maximum branching ratio (number of copies) per walker")
   call cfg_add(cfg, "initial_energy", 0.0_dp, &
        "Initial energy estimate (atomic units)")
   call cfg_add(cfg, "kappa", 2.0_dp, &
@@ -110,10 +112,10 @@ contains
     type(walkers_t), intent(inout) :: walkers
     character(len=20)              :: initial_distribution
     integer                        :: i, idim
+    integer(int64)                 :: initial_seed(2)
 
     call cfg_get(cfg, "num_walkers", walkers%n)
     call cfg_get(cfg, "ndim", walkers%ndim)
-    call cfg_get(cfg, "walkers_branch_limit", walkers%branch_limit)
 
     allocate(walkers%w(walkers%n))
     allocate(walkers%x(walkers%ndim, walkers%n))
@@ -122,6 +124,8 @@ contains
     allocate(walkers%x_new(walkers%ndim, walkers%n))
     allocate(walkers%phi_new(walkers%n))
     allocate(walkers%cdf(walkers%n))
+
+    allocate(walkers%s(2, walkers%n))
 
     call cfg_get(cfg, "initial_distribution", initial_distribution)
 
@@ -142,6 +146,16 @@ contains
        walkers%w(i) = 1.0_dp
     end do
 
+    ! Set initial seeds
+    initial_seed = [1234_int64, -89234_int64]
+
+    walkers%s(:, 1) = initial_seed
+
+    do i = 2, walkers%n
+       walkers%s(:, i) = walkers%s(:, i-1)
+       call jump(walkers%s(1, i), walkers%s(2, i))
+    end do
+
   end subroutine walkers_initialize
 
   subroutine walkers_update(walkers, dt, trial_energy, local_energy, &
@@ -152,24 +166,34 @@ contains
     real(dp), intent(out)          :: sum_w
     real(dp), intent(out)          :: n_eff
     integer                        :: i, idim
-    real(dp)                       :: phi_old, phi_avg, sqrt_dt
+    real(dp)                       :: phi_avg, sqrt_dt, exp_arg
     real(dp)                       :: sum_w2, sum_we
+    real(real32)                   :: rr(2*((walkers%ndim+1)/2))
 
     sqrt_dt = sqrt(dt)
     sum_w  = 0.0_dp
     sum_we = 0.0_dp
     sum_w2 = 0.0_dp
 
+    !$omp parallel do private(phi_avg, idim, exp_arg), reduction(+: sum_w, sum_we, sum_w2)
     do i = 1, walkers%n
-       phi_old = walkers%phi(i)
-       do idim = 1, walkers%ndim
-          walkers%x(idim, i) = walkers%x(idim, i) + sqrt_dt * rng%normal()
-       end do
-       call compute_potential(walkers, i)
-       phi_avg = 0.5_dp * (walkers%phi(i) + phi_old)
+       phi_avg = walkers%phi(i)
 
-       walkers%w(i) = walkers%w(i) * &
-            exp(-dt * (phi_avg - trial_energy))
+       do idim = 1, (walkers%ndim+1)/2
+          call box_muller_32(walkers%s(1, i), walkers%s(2, i), &
+               rr(2*idim-1), rr(2*idim))
+       end do
+
+       do idim = 1, walkers%ndim
+          walkers%x(idim, i) = walkers%x(idim, i) + sqrt_dt * rr(idim)
+       end do
+
+       call compute_potential(walkers, i)
+       phi_avg = 0.5_dp * (phi_avg + walkers%phi(i))
+
+       exp_arg = -dt * (phi_avg - trial_energy)
+       exp_arg = min(exp_arg, 2.0_dp)
+       walkers%w(i) = walkers%w(i) * exp(exp_arg)
 
        sum_w  = sum_w  + walkers%w(i)
        sum_we = sum_we + walkers%w(i) * phi_avg
@@ -238,7 +262,132 @@ contains
     integer, intent(in)            :: i
 
     ! walkers%phi(i) = 0.5_dp * sum(walkers%x(:, i)**2)
-    walkers%phi(i) = -1.0_dp / norm2(walkers%x(:, i))
+    walkers%phi(i) = -1 / norm2(walkers%x(:, i))
   end subroutine compute_potential
+
+  pure subroutine next(s1, s2, res)
+    !$acc routine seq
+    integer(int64), intent(inout) :: s1, s2
+    integer(int64), intent(out)   :: res
+    integer(int64)                :: t1, t2
+
+    t1  = s1
+    t2  = s2
+    res = t1 + t2
+    t2  = ieor(t1, t2)
+    s1  = ieor(ieor(ishftc(t1, 24), t2), ishft(t2, 16))
+    s2  = ishftc(t2, 37)
+  end subroutine next
+
+  ! This is the jump function for the generator. It is equivalent
+  ! to 2^64 calls to next(); it can be used to generate 2^64
+  ! non-overlapping subsequences for parallel computations.
+  pure subroutine jump(s1, s2)
+    !$acc routine seq
+    integer(int64), intent(inout) :: s1, s2
+    integer                       :: i, b
+    integer(int64)                :: t1, t2, dummy
+    integer(int64), parameter     :: jmp_c(2) = &
+         [-2337365368286915419_int64, 1659688472399708668_int64]
+
+    t1 = 0
+    t2 = 0
+    do i = 1, 2
+       do b = 0, 63
+          if (iand(jmp_c(i), ishft(1_int64, b)) /= 0) then
+             t1 = ieor(t1, s1)
+             t2 = ieor(t2, s2)
+          end if
+          call next(s1, s2, dummy)
+       end do
+    end do
+
+    s1 = t1
+    s2 = t2
+  end subroutine jump
+
+  ! A [0, 1) random number
+  pure function uni01_64(x) result(u)
+    !$acc routine seq
+    integer(int64), intent(in) :: x
+    integer(int64)             :: y
+    real(real64)               :: u
+    y = ior(ishft(1023_int64, 52), ishft(x, -12))
+    u = transfer(y, u)
+  end function uni01_64
+
+  ! A (0, 1] random number
+  pure function uni01o_64(x) result(u)
+    !$acc routine seq
+    integer(int64), intent(in) :: x
+    integer(int64)             :: y
+    real(real64)               :: u
+    y = ior(ishft(1023_int64, 52), ishft(x, -12))
+    u = 2.0_real64 - transfer(y, u)
+  end function uni01o_64
+
+  ! A [0, 1) single-precision random number from 32 random bits
+  pure function uni01_32(x) result(u)
+    !$acc routine seq
+    integer(int32), intent(in) :: x
+    integer(int32)             :: y
+    real(real32)               :: u
+    ! IEEE-754 single: exponent bias 127 -> 127<<23 = 0x3F800000
+    ! use top 23 bits of x as mantissa (shift right by 9)
+    y = ior(ishft(127_int32, 23), ishft(x, -9))
+    u = transfer(y, u) - 1
+  end function uni01_32
+
+  ! A (0, 1] single-precision random number from 32 random bits
+  pure function uni01o_32(x) result(u)
+    !$acc routine seq
+    integer(int32), intent(in) :: x
+    integer(int32)             :: y
+    real(real32)               :: u
+    y = ior(ishft(127_int32, 23), ishft(x, -9))
+    u = 2.0_real32 - transfer(y, u)
+  end function uni01o_32
+
+  pure subroutine box_muller_64(s1, s2, z1, z2)
+    !$acc routine seq
+    integer(int64), intent(inout) :: s1, s2
+    real(real64),   intent(out)   :: z1, z2
+    integer(int64)                :: x
+    real(real64)                  :: u1, u2, r, theta
+    real(real64), parameter       :: two_pi = 8 * atan(1.0_real64)
+
+    call next(s1, s2, x)
+    u1 = uni01o_64(x) ! (0, 1]  -> safe for log
+
+    call next(s1, s2, x)
+    u2 = uni01o_64(x)
+
+    r     = sqrt(-2 * log(u1))
+    theta = two_pi * u2
+    z1    = r * cos(theta)
+    z2    = r * sin(theta)
+  end subroutine box_muller_64
+
+  pure subroutine box_muller_32(s1, s2, z1, z2)
+    !$acc routine seq
+    integer(int64), intent(inout) :: s1, s2
+    real(real32),   intent(out)   :: z1, z2
+    integer(int64)                :: x
+    integer(int32)                :: xhi, xlo
+    real(real32)                  :: u1, u2, r, theta
+    real(real32), parameter       :: two_pi = 8 * atan(1.0_real32)
+
+    call next(s1, s2, x)
+    xhi = int(ishft(x, -32), int32)   ! top 32 bits
+    xlo = int(x, int32)               ! bottom 32 bits
+
+    u1 = uni01o_32(xhi) ! (0, 1]  -> safe for log
+    u2 = uni01o_32(xlo)
+
+    r     = sqrt(-2.0_real32 * log(u1))
+    theta = two_pi * u2
+    z1    = r * cos(theta)
+    z2    = r * sin(theta)
+  end subroutine box_muller_32
 
 end program qmc

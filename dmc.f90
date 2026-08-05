@@ -12,15 +12,23 @@ program qmc
   integer, parameter :: dp = real64
   integer, parameter :: fp = real32
 
+  integer, parameter :: potential_atom     = 1
+  integer, parameter :: potential_harmonic = 2
+  integer            :: potential_type
+
   type walkers_t
      integer               :: n
-     integer               :: ndim
+     integer               :: n_dim
+     integer               :: n_particles
+     integer               :: n_spin_up
+     integer               :: n_spin_down
      real(dp)              :: n_eff_frac = 0.8_dp
      real(fp), allocatable :: w(:)
-     real(fp), allocatable :: x(:, :)
+     real(fp), allocatable :: x(:, :, :)
      real(fp), allocatable :: phi(:)
+     integer, allocatable  :: regions(:, :)
      ! For updating population
-     real(fp), allocatable :: x_new(:, :)
+     real(fp), allocatable :: x_new(:, :, :)
      real(fp), allocatable :: phi_new(:)
      real(dp), allocatable :: cdf(:)
      ! Random seed state
@@ -35,23 +43,32 @@ program qmc
   real(dp)              :: mean_local_energy
   real(dp), allocatable :: mean_local_energy_array(:)
   real(dp)              :: ratio, kappa
-  real(dp)              :: sum_w, n_eff
+  real(dp)              :: sum_w, n_eff, tmp_float64
+  character(len=40)     :: potential_name
+
+  real(fp) :: atom_z
 
   integer  :: batch_size, trunc_obs, status
   real(dp) :: min_mser
-  logical, parameter  :: correct_autocorr = .true.
+  logical, parameter :: correct_autocorr = .true.
 
-  call cfg_add(cfg, "potential_type", "harmonic", &
+  call cfg_add(cfg, "potential", "atom", &
        "Type of potential")
+  call cfg_add(cfg, "atom_z", 1.0_dp, &
+       "Atomic number")
   call cfg_add(cfg, "initial_distribution", "uniform", &
        "Initial walker distribution")
-  call cfg_add(cfg, "ndim", 3, &
-       "Number of dimensions for wave function (D * n_particles)")
+  call cfg_add(cfg, "n_dim", 3, &
+       "Number of dimensions for wave function")
+  call cfg_add(cfg, "n_particles", 1, &
+       "Number of particles")
+  call cfg_add(cfg, "n_spin_up", 0, &
+       "Number of particles with spin up")
   call cfg_add(cfg, "dt", 1e-2_dp, &
        "Time step (atomic units)")
   call cfg_add(cfg, "end_time", 40.0_dp, &
        "End time (atomic units)")
-  call cfg_add(cfg, "num_walkers", 10000, &
+  call cfg_add(cfg, "num_walkers", 1000, &
        "Number of walkers")
   call cfg_add(cfg, "initial_energy", 0.0_dp, &
        "Initial energy estimate (atomic units)")
@@ -70,6 +87,19 @@ program qmc
   call cfg_get(cfg, "kappa", kappa)
   call cfg_get(cfg, "batch_size", batch_size)
 
+  call cfg_get(cfg, "potential", potential_name)
+  call cfg_get(cfg, "atom_z", tmp_float64)
+
+  select case (potential_name)
+  case ("atom")
+     potential_type = potential_atom
+  case ("harmonic")
+     potential_type = potential_harmonic
+  case default
+     error stop "Unknown potential type"
+  end select
+
+  atom_z = real(tmp_float64, fp)
   max_steps = ceiling(end_time/dt)
 
   call walkers_initialize(cfg, walkers)
@@ -107,21 +137,23 @@ contains
     type(cfg_t), intent(inout)     :: cfg
     type(walkers_t), intent(inout) :: walkers
     character(len=20)              :: initial_distribution
-    integer                        :: i, idim
+    integer                        :: i, n, idim
     integer(int64)                 :: initial_seed(2), rand_int64
 
     call cfg_get(cfg, "num_walkers", walkers%n)
-    call cfg_get(cfg, "ndim", walkers%ndim)
+    call cfg_get(cfg, "n_dim", walkers%n_dim)
+    call cfg_get(cfg, "n_particles", walkers%n_particles)
+    call cfg_get(cfg, "n_spin_up", walkers%n_spin_up)
+    walkers%n_spin_down = walkers%n_particles - walkers%n_spin_up
 
     allocate(walkers%w(walkers%n))
-    allocate(walkers%x(walkers%ndim, walkers%n))
+    allocate(walkers%x(walkers%n_dim, walkers%n_particles, walkers%n))
     allocate(walkers%phi(walkers%n))
-
-    allocate(walkers%x_new(walkers%ndim, walkers%n))
+    allocate(walkers%x_new(walkers%n_dim, walkers%n_particles, walkers%n))
     allocate(walkers%phi_new(walkers%n))
     allocate(walkers%cdf(walkers%n))
-
     allocate(walkers%s(2, walkers%n))
+    allocate(walkers%regions(2, walkers%n))
 
     ! Set initial seeds
     initial_seed = [1234_int64, -89234_int64]
@@ -138,9 +170,11 @@ contains
     select case (initial_distribution)
     case ("uniform")
        do i = 1, walkers%n
-          do idim = 1, walkers%ndim
-             call next(walkers%s(1, i), walkers%s(2, i), rand_int64)
-             walkers%x(idim, i) = real(uni01_64(rand_int64) - 0.5_dp, fp)
+          do n = 1, walkers%n_particles
+             do idim = 1, walkers%n_dim
+                call next(walkers%s(1, i), walkers%s(2, i), rand_int64)
+                walkers%x(idim, n, i) = real(uni01_64(rand_int64) - 0.5_dp, fp)
+             end do
           end do
        end do
     case default
@@ -151,6 +185,7 @@ contains
     do i = 1, walkers%n
        call compute_potential(walkers, i)
        walkers%w(i) = 1.0_dp
+       call set_regions(walkers, i)
     end do
 
   end subroutine walkers_initialize
@@ -162,30 +197,43 @@ contains
     real(dp), intent(out)          :: local_energy
     real(dp), intent(out)          :: sum_w
     real(dp), intent(out)          :: n_eff
-    integer                        :: i, idim
+    integer                        :: i, n, idim, ix, old_regions(2)
     real(fp)                       :: sqrt_dt, phi_avg, exp_arg
     real(dp)                       :: sum_w2, sum_we
-    real(fp)                       :: rr(2*((walkers%ndim+1)/2))
+    real(fp)                       :: rr(walkers%n_particles*walkers%n_dim + 1)
 
     sqrt_dt = sqrt(real(dt, fp))
     sum_w  = 0.0_dp
     sum_we = 0.0_dp
     sum_w2 = 0.0_dp
 
-    !$omp parallel do private(phi_avg, idim, exp_arg), reduction(+: sum_w, sum_we, sum_w2)
+    !$omp parallel do private(phi_avg, n, rr, idim, ix, exp_arg, old_regions) &
+    !$omp &reduction(+: sum_w, sum_we, sum_w2)
     do i = 1, walkers%n
        phi_avg = walkers%phi(i)
+       old_regions = walkers%regions(:, i)
 
-       do idim = 1, (walkers%ndim+1)/2
-          call box_muller_32(walkers%s(1, i), walkers%s(2, i), &
-               rr(2*idim-1), rr(2*idim))
+       do n = 1, (walkers%n_particles * walkers%n_dim + 1)/2
+          call box_muller_32(walkers%s(1, i), walkers%s(2, i), rr(2*n-1), rr(2*n))
        end do
 
-       do idim = 1, walkers%ndim
-          walkers%x(idim, i) = walkers%x(idim, i) + sqrt_dt * rr(idim)
+       do n = 1, walkers%n_particles
+          do idim = 1, walkers%n_dim
+             ix = (n - 1) * walkers%n_dim + idim
+             walkers%x(idim, n, i) = walkers%x(idim, n, i) + sqrt_dt * rr(ix)
+          end do
        end do
 
-       call compute_potential(walkers, i)
+       call set_regions(walkers, i)
+
+       if (any(walkers%regions(:, i) /= old_regions)) then
+          ! Kill walker
+          walkers%w(i) = 0
+       else
+          ! Compute new potential
+          call compute_potential(walkers, i)
+       end if
+
        phi_avg = 0.5_fp * (phi_avg + walkers%phi(i))
 
        exp_arg = real(-dt * (phi_avg - trial_energy), fp)
@@ -200,6 +248,54 @@ contains
     local_energy = sum_we / sum_w
     n_eff = sum_w**2 / sum_w2
   end subroutine walkers_update
+
+  subroutine set_regions(walkers, i)
+    type(walkers_t), intent(inout) :: walkers
+    integer, intent(in)            :: i
+
+    associate (n_up => walkers%n_spin_up, n_down => walkers%n_spin_down, &
+         n_dim => walkers%n_dim, regions => walkers%regions(:, i))
+      if (n_up <= 1) then
+         regions(1) = 1
+      else
+         regions(1) = spin_up_region(n_up, n_dim, walkers%x(:, 1:n_up, i))
+      end if
+
+      if (n_down <= 1) then
+         regions(2) = 1
+      else
+         regions(2) = spin_down_region(n_down, n_dim, walkers%x(:, n_up+1:, i))
+      end if
+    end associate
+  end subroutine set_regions
+
+  integer function spin_up_region(n, ndim, x)
+    integer, intent(in) :: n, ndim
+    real(fp)            :: x(ndim, n)
+    spin_up_region = spin_region_ho_2d(n, ndim, x)
+  end function spin_up_region
+
+  integer function spin_down_region(n, ndim, x)
+    integer, intent(in) :: n, ndim
+    real(fp)            :: x(ndim, n)
+    spin_down_region = spin_region_ho_2d(n, ndim, x)
+  end function spin_down_region
+
+  integer function spin_region_ho_2d(n, ndim, x)
+    integer, intent(in) :: n, ndim
+    real(fp), intent(in):: x(ndim, n)
+    real(fp)            :: s
+
+    if (n /= 2 .or. ndim /= 2) error stop "assuming n = 2 and ndim = 2"
+
+    s = x(1, 1) * x(2, 2) - x(1, 2) * x(2, 1)
+
+    if (s < 0.0_fp) then
+       spin_region_ho_2d = -1
+    else
+       spin_region_ho_2d = 1
+    end if
+  end function spin_region_ho_2d
 
   subroutine systematic_resample(walkers, sum_w)
     type(walkers_t), intent(inout) :: walkers
@@ -228,13 +324,13 @@ contains
       do i = 1, n
          pos = u0 + (i-1) * step
          j   = upper_bound(cdf, pos)      ! first index with cdf(j) >= pos
-         x_new(:, i) = walkers%x(:, j)
+         x_new(:, :, i) = walkers%x(:, :, j)
          phi_new(i)  = walkers%phi(j)
       end do
 
       mean_w = sum_w / n
       do i = 1, n
-         walkers%x(:, i) = x_new(:, i)
+         walkers%x(:, :, i) = x_new(:, :, i)
          walkers%phi(i)  = phi_new(i)
          walkers%w(i)    = real(mean_w, fp)
       end do
@@ -256,166 +352,51 @@ contains
     end do
   end function upper_bound
 
-  subroutine compute_potential(walkers, i)
+  pure subroutine compute_potential(walkers, i)
     type(walkers_t), intent(inout) :: walkers
     integer, intent(in)            :: i
 
-    ! walkers%phi(i) = 0.5_dp * sum(walkers%x(:, i)**2)
-    walkers%phi(i) = -1 / norm2(walkers%x(:, i))
+    select case (potential_type)
+    case (potential_atom)
+       call compute_potential_atom(walkers, i)
+    case (potential_harmonic)
+       call compute_potential_harmonic(walkers, i)
+    end select
   end subroutine compute_potential
 
-!   subroutine compute_potential(walkers, i)
-!     type(walkers_t), intent(inout) :: walkers
-!     integer, intent(in) :: i
-!     real(dp) :: r1, r2, r3, r12, r13, r23
-!     real(dp) :: x(3,3)  ! 3 electrons, 3 dims
-!     integer :: Z
+  pure subroutine compute_potential_atom(walkers, i)
+    type(walkers_t), intent(inout) :: walkers
+    integer, intent(in)            :: i
+    integer                        :: n, m
 
-!     Z = 3  ! lithium nuclear charge
+    walkers%phi(i) = 0.0_dp
 
-!     ! Reshape the 9D coordinate into 3 electron positions
-!     x(:,1) = walkers%x(1:3, i)
-!     x(:,2) = walkers%x(4:6, i)
-!     x(:,3) = walkers%x(7:9, i)
-
-!     ! Electron-nucleus distances
-!     r1 = norm2(x(:,1))
-!     r2 = norm2(x(:,2))
-!     r3 = norm2(x(:,3))
-
-!     ! Electron-electron distances
-!     r12 = norm2(x(:,1) - x(:,2))
-!     r13 = norm2(x(:,1) - x(:,3))
-!     r23 = norm2(x(:,2) - x(:,3))
-
-!     ! V = -Z/r1 - Z/r2 - Z/r3 + 1/r12 + 1/r13 + 1/r23
-!     walkers%phi(i) = -Z/r1 - Z/r2 - Z/r3 &
-!                      + 1.0_dp/r12 + 1.0_dp/r13 + 1.0_dp/r23
-! end subroutine
-
-  pure subroutine next(s1, s2, res)
-    !$acc routine seq
-    integer(int64), intent(inout) :: s1, s2
-    integer(int64), intent(out)   :: res
-    integer(int64)                :: t1, t2
-
-    t1  = s1
-    t2  = s2
-    res = t1 + t2
-    t2  = ieor(t1, t2)
-    s1  = ieor(ieor(ishftc(t1, 24), t2), ishft(t2, 16))
-    s2  = ishftc(t2, 37)
-  end subroutine next
-
-  ! This is the jump function for the generator. It is equivalent
-  ! to 2^64 calls to next(); it can be used to generate 2^64
-  ! non-overlapping subsequences for parallel computations.
-  pure subroutine jump(s1, s2)
-    !$acc routine seq
-    integer(int64), intent(inout) :: s1, s2
-    integer                       :: i, b
-    integer(int64)                :: t1, t2, dummy
-    integer(int64), parameter     :: jmp_c(2) = &
-         [-2337365368286915419_int64, 1659688472399708668_int64]
-
-    t1 = 0
-    t2 = 0
-    do i = 1, 2
-       do b = 0, 63
-          if (iand(jmp_c(i), ishft(1_int64, b)) /= 0) then
-             t1 = ieor(t1, s1)
-             t2 = ieor(t2, s2)
-          end if
-          call next(s1, s2, dummy)
-       end do
+    ! Electron-nucleus terms
+    do n = 1, walkers%n_particles
+       walkers%phi(i) = walkers%phi(i) - atom_z/norm2(walkers%x(:, n, i))
     end do
 
-    s1 = t1
-    s2 = t2
-  end subroutine jump
+    ! Electron-electron terms
+    do n = 1, walkers%n_particles
+       do m = n+1, walkers%n_particles
+          walkers%phi(i) = walkers%phi(i) + &
+               1/norm2(walkers%x(:, n, i) - walkers%x(:, m, i))
+       end do
+    end do
+  end subroutine compute_potential_atom
 
-  ! A [0, 1) random number
-  pure function uni01_64(x) result(u)
-    !$acc routine seq
-    integer(int64), intent(in) :: x
-    integer(int64)             :: y
-    real(real64)               :: u
-    y = ior(ishft(1023_int64, 52), ishft(x, -12))
-    u = transfer(y, u)
-  end function uni01_64
+  pure subroutine compute_potential_harmonic(walkers, i)
+    type(walkers_t), intent(inout) :: walkers
+    integer, intent(in)            :: i
+    integer                        :: n
 
-  ! A (0, 1] random number
-  pure function uni01o_64(x) result(u)
-    !$acc routine seq
-    integer(int64), intent(in) :: x
-    integer(int64)             :: y
-    real(real64)               :: u
-    y = ior(ishft(1023_int64, 52), ishft(x, -12))
-    u = 2.0_real64 - transfer(y, u)
-  end function uni01o_64
+    walkers%phi(i) = 0.0_dp
 
-  ! A [0, 1) single-precision random number from 32 random bits
-  pure function uni01_32(x) result(u)
-    !$acc routine seq
-    integer(int32), intent(in) :: x
-    integer(int32)             :: y
-    real(real32)               :: u
-    ! IEEE-754 single: exponent bias 127 -> 127<<23 = 0x3F800000
-    ! use top 23 bits of x as mantissa (shift right by 9)
-    y = ior(ishft(127_int32, 23), ishft(x, -9))
-    u = transfer(y, u) - 1
-  end function uni01_32
+    do n = 1, walkers%n_particles
+       walkers%phi(i) = walkers%phi(i) + 0.5_fp * sum(walkers%x(:, n, i)**2)
+    end do
+  end subroutine compute_potential_harmonic
 
-  ! A (0, 1] single-precision random number from 32 random bits
-  pure function uni01o_32(x) result(u)
-    !$acc routine seq
-    integer(int32), intent(in) :: x
-    integer(int32)             :: y
-    real(real32)               :: u
-    y = ior(ishft(127_int32, 23), ishft(x, -9))
-    u = 2.0_real32 - transfer(y, u)
-  end function uni01o_32
+  include 'rng.f90'
 
-  pure subroutine box_muller_64(s1, s2, z1, z2)
-    !$acc routine seq
-    integer(int64), intent(inout) :: s1, s2
-    real(real64),   intent(out)   :: z1, z2
-    integer(int64)                :: x
-    real(real64)                  :: u1, u2, r, theta
-    real(real64), parameter       :: two_pi = 8 * atan(1.0_real64)
-
-    call next(s1, s2, x)
-    u1 = uni01o_64(x) ! (0, 1]  -> safe for log
-
-    call next(s1, s2, x)
-    u2 = uni01o_64(x)
-
-    r     = sqrt(-2 * log(u1))
-    theta = two_pi * u2
-    z1    = r * cos(theta)
-    z2    = r * sin(theta)
-  end subroutine box_muller_64
-
-  pure subroutine box_muller_32(s1, s2, z1, z2)
-    !$acc routine seq
-    integer(int64), intent(inout) :: s1, s2
-    real(real32),   intent(out)   :: z1, z2
-    integer(int64)                :: x
-    integer(int32)                :: xhi, xlo
-    real(real32)                  :: u1, u2, r, theta
-    real(real32), parameter       :: two_pi = 8 * atan(1.0_real32)
-
-    call next(s1, s2, x)
-    xhi = int(ishft(x, -32), int32)   ! top 32 bits
-    xlo = int(x, int32)               ! bottom 32 bits
-
-    u1 = uni01o_32(xhi) ! (0, 1]  -> safe for log
-    u2 = uni01o_32(xlo)
-
-    r     = sqrt(-2.0_real32 * log(u1))
-    theta = two_pi * u2
-    z1    = r * cos(theta)
-    z2    = r * sin(theta)
-  end subroutine box_muller_32
-
-end program qmc
+end program

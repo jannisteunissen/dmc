@@ -57,6 +57,7 @@ contains
     if (n < 2) then
        optimal_d = 0
        min_mser  = huge(1.0_dp)
+       steady_mean = huge(1.0_dp)
        if (store_mser) mser_values(0) = huge(1.0_dp)
        return
     end if

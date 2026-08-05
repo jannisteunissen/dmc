@@ -1,6 +1,6 @@
 FC := gfortran
-FFLAGS := -O3 -march=native -flto -g -std=f2008 -Wall -Wextra -fopenmp
-OBJS := m_config.o m_random.o m_mser.o
+FFLAGS := -O3 -march=native -g -std=f2008 -Wall -Wextra -fopenmp
+OBJS := m_config.o m_mser.o
 TESTS := dmc
 
 .PHONY:	all clean

@@ -5,31 +5,29 @@
 program qmc
   use iso_fortran_env, only: error_unit, real32, real64, int32, int64
   use m_config
-  use m_random
   use m_mser
 
   implicit none
 
   integer, parameter :: dp = real64
-  integer, parameter :: sp = real32
+  integer, parameter :: fp = real32
 
   type walkers_t
      integer               :: n
      integer               :: ndim
      real(dp)              :: n_eff_frac = 0.8_dp
-     real(sp), allocatable :: w(:)
-     real(sp), allocatable :: x(:, :)
-     real(sp), allocatable :: phi(:)
+     real(fp), allocatable :: w(:)
+     real(fp), allocatable :: x(:, :)
+     real(fp), allocatable :: phi(:)
      ! For updating population
-     real(sp), allocatable :: x_new(:, :)
-     real(sp), allocatable :: phi_new(:)
+     real(fp), allocatable :: x_new(:, :)
+     real(fp), allocatable :: phi_new(:)
      real(dp), allocatable :: cdf(:)
      ! Random seed state
      integer(int64), allocatable :: s(:, :)
   end type walkers_t
 
   type(cfg_t)           :: cfg
-  type(rng_t)           :: rng
   type(walkers_t)       :: walkers
   integer               :: n_steps, max_steps
   real(dp)              :: dt, time, end_time
@@ -49,12 +47,12 @@ program qmc
        "Initial walker distribution")
   call cfg_add(cfg, "ndim", 3, &
        "Number of dimensions for wave function (D * n_particles)")
-  call cfg_add(cfg, "dt", 5e-3_dp, &
+  call cfg_add(cfg, "dt", 1e-2_dp, &
        "Time step (atomic units)")
-  call cfg_add(cfg, "end_time", 20.0_dp, &
+  call cfg_add(cfg, "end_time", 40.0_dp, &
        "End time (atomic units)")
-  call cfg_add(cfg, "num_walkers", 100000, &
-       "Target number of walkers")
+  call cfg_add(cfg, "num_walkers", 10000, &
+       "Number of walkers")
   call cfg_add(cfg, "initial_energy", 0.0_dp, &
        "Initial energy estimate (atomic units)")
   call cfg_add(cfg, "kappa", 2.0_dp, &
@@ -74,8 +72,6 @@ program qmc
 
   max_steps = ceiling(end_time/dt)
 
-  call rng%set_random_seed()
-
   call walkers_initialize(cfg, walkers)
 
   allocate(mean_local_energy_array(max_steps))
@@ -89,7 +85,7 @@ program qmc
           mean_local_energy_array(n_steps), sum_w, n_eff)
 
      if (n_eff < walkers%n_eff_frac * walkers%n) then
-        call systematic_resample(walkers, rng, sum_w)
+        call systematic_resample(walkers, sum_w)
      end if
 
      if (mod(n_steps, max_steps/100) == 0) then
@@ -112,7 +108,7 @@ contains
     type(walkers_t), intent(inout) :: walkers
     character(len=20)              :: initial_distribution
     integer                        :: i, idim
-    integer(int64)                 :: initial_seed(2)
+    integer(int64)                 :: initial_seed(2), rand_int64
 
     call cfg_get(cfg, "num_walkers", walkers%n)
     call cfg_get(cfg, "ndim", walkers%ndim)
@@ -127,13 +123,24 @@ contains
 
     allocate(walkers%s(2, walkers%n))
 
+    ! Set initial seeds
+    initial_seed = [1234_int64, -89234_int64]
+
+    walkers%s(:, 1) = initial_seed
+
+    do i = 2, walkers%n
+       walkers%s(:, i) = walkers%s(:, i-1)
+       call jump(walkers%s(1, i), walkers%s(2, i))
+    end do
+
     call cfg_get(cfg, "initial_distribution", initial_distribution)
 
     select case (initial_distribution)
     case ("uniform")
        do i = 1, walkers%n
           do idim = 1, walkers%ndim
-             walkers%x(idim, i) = rng%unif_01() - 0.5_dp
+             call next(walkers%s(1, i), walkers%s(2, i), rand_int64)
+             walkers%x(idim, i) = real(uni01_64(rand_int64) - 0.5_dp, fp)
           end do
        end do
     case default
@@ -146,16 +153,6 @@ contains
        walkers%w(i) = 1.0_dp
     end do
 
-    ! Set initial seeds
-    initial_seed = [1234_int64, -89234_int64]
-
-    walkers%s(:, 1) = initial_seed
-
-    do i = 2, walkers%n
-       walkers%s(:, i) = walkers%s(:, i-1)
-       call jump(walkers%s(1, i), walkers%s(2, i))
-    end do
-
   end subroutine walkers_initialize
 
   subroutine walkers_update(walkers, dt, trial_energy, local_energy, &
@@ -166,11 +163,11 @@ contains
     real(dp), intent(out)          :: sum_w
     real(dp), intent(out)          :: n_eff
     integer                        :: i, idim
-    real(dp)                       :: phi_avg, sqrt_dt, exp_arg
+    real(fp)                       :: sqrt_dt, phi_avg, exp_arg
     real(dp)                       :: sum_w2, sum_we
-    real(real32)                   :: rr(2*((walkers%ndim+1)/2))
+    real(fp)                       :: rr(2*((walkers%ndim+1)/2))
 
-    sqrt_dt = sqrt(dt)
+    sqrt_dt = sqrt(real(dt, fp))
     sum_w  = 0.0_dp
     sum_we = 0.0_dp
     sum_w2 = 0.0_dp
@@ -189,10 +186,10 @@ contains
        end do
 
        call compute_potential(walkers, i)
-       phi_avg = 0.5_dp * (phi_avg + walkers%phi(i))
+       phi_avg = 0.5_fp * (phi_avg + walkers%phi(i))
 
-       exp_arg = -dt * (phi_avg - trial_energy)
-       exp_arg = min(exp_arg, 2.0_dp)
+       exp_arg = real(-dt * (phi_avg - trial_energy), fp)
+       exp_arg = min(exp_arg, 2.0_fp)
        walkers%w(i) = walkers%w(i) * exp(exp_arg)
 
        sum_w  = sum_w  + walkers%w(i)
@@ -204,40 +201,42 @@ contains
     n_eff = sum_w**2 / sum_w2
   end subroutine walkers_update
 
-  subroutine systematic_resample(walkers, rng, sum_w)
+  subroutine systematic_resample(walkers, sum_w)
     type(walkers_t), intent(inout) :: walkers
-    type(rng_t), intent(inout)     :: rng
     real(dp), intent(in)           :: sum_w
     integer                        :: i, j, n
-    real(dp)                       :: u0, step, mean_w, pos
+    integer(int64)                 :: rand_int64
+    real(dp)                       :: u0, step, mean_w, pos, prefix_sum
 
     n = walkers%n
 
     associate (cdf => walkers%cdf, x_new => walkers%x_new, phi_new => walkers%phi_new)
-      cdf(1) = walkers%w(1)
-      do i = 2, n
-         cdf(i) = cdf(i-1) + walkers%w(i)
+
+      prefix_sum = 0.0
+      !$omp parallel do reduction(inscan, +:prefix_sum)
+      do i = 1, n
+         prefix_sum = prefix_sum + walkers%w(i)
+         !$omp scan inclusive(prefix_sum)
+         cdf(i) = prefix_sum
       end do
 
       step = sum_w / n
-      u0   = rng%unif_01() * step        ! single random offset
 
-      ! --- gather step: fully parallel, each thread independent ---
-      !$acc data copyin(cdf, walkers%x, walkers%phi) &
-      !$acc      copyout(x_new, phi_new)
-      !$acc parallel loop private(pos, j)
+      call next(walkers%s(1, 1), walkers%s(2, 1), rand_int64)
+      u0 = uni01_64(rand_int64) * step        ! single random offset
+
       do i = 1, n
          pos = u0 + (i-1) * step
          j   = upper_bound(cdf, pos)      ! first index with cdf(j) >= pos
          x_new(:, i) = walkers%x(:, j)
-         phi_new(i)  = walkers%phi(j)     ! copy phi, do NOT recompute
+         phi_new(i)  = walkers%phi(j)
       end do
 
       mean_w = sum_w / n
       do i = 1, n
          walkers%x(:, i) = x_new(:, i)
          walkers%phi(i)  = phi_new(i)
-         walkers%w(i)    = mean_w
+         walkers%w(i)    = real(mean_w, fp)
       end do
     end associate
   end subroutine systematic_resample
@@ -245,7 +244,7 @@ contains
   pure integer function upper_bound(cdf, val) result(lo)
     !$acc routine seq
     real(dp), intent(in) :: cdf(:), val
-    integer :: hi, mid
+    integer              :: hi, mid
     lo = 1; hi = size(cdf)
     do while (lo < hi)
        mid = (lo + hi) / 2
@@ -264,6 +263,35 @@ contains
     ! walkers%phi(i) = 0.5_dp * sum(walkers%x(:, i)**2)
     walkers%phi(i) = -1 / norm2(walkers%x(:, i))
   end subroutine compute_potential
+
+!   subroutine compute_potential(walkers, i)
+!     type(walkers_t), intent(inout) :: walkers
+!     integer, intent(in) :: i
+!     real(dp) :: r1, r2, r3, r12, r13, r23
+!     real(dp) :: x(3,3)  ! 3 electrons, 3 dims
+!     integer :: Z
+
+!     Z = 3  ! lithium nuclear charge
+
+!     ! Reshape the 9D coordinate into 3 electron positions
+!     x(:,1) = walkers%x(1:3, i)
+!     x(:,2) = walkers%x(4:6, i)
+!     x(:,3) = walkers%x(7:9, i)
+
+!     ! Electron-nucleus distances
+!     r1 = norm2(x(:,1))
+!     r2 = norm2(x(:,2))
+!     r3 = norm2(x(:,3))
+
+!     ! Electron-electron distances
+!     r12 = norm2(x(:,1) - x(:,2))
+!     r13 = norm2(x(:,1) - x(:,3))
+!     r23 = norm2(x(:,2) - x(:,3))
+
+!     ! V = -Z/r1 - Z/r2 - Z/r3 + 1/r12 + 1/r13 + 1/r23
+!     walkers%phi(i) = -Z/r1 - Z/r2 - Z/r3 &
+!                      + 1.0_dp/r12 + 1.0_dp/r13 + 1.0_dp/r23
+! end subroutine
 
   pure subroutine next(s1, s2, res)
     !$acc routine seq

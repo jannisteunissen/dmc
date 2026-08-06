@@ -30,6 +30,7 @@ program qmc
      ! For updating population
      real(fp), allocatable :: x_new(:, :, :)
      real(fp), allocatable :: phi_new(:)
+     integer, allocatable  :: regions_new(:, :)
      real(dp), allocatable :: cdf(:)
      ! Random seed state
      integer(int64), allocatable :: s(:, :)
@@ -122,6 +123,7 @@ program qmc
         call mser_analysis(n_steps, mean_local_energy_array, batch_size, &
              correct_autocorr, trunc_obs, mean_local_energy, min_mser, status)
         print *, "AVG", n_steps, time, trunc_obs, mean_local_energy, sqrt(min_mser)
+        print *, trial_energy
      end if
 
      time = time + dt
@@ -154,6 +156,7 @@ contains
     allocate(walkers%cdf(walkers%n))
     allocate(walkers%s(2, walkers%n))
     allocate(walkers%regions(2, walkers%n))
+    allocate(walkers%regions_new(2, walkers%n))
 
     ! Set initial seeds
     initial_seed = [1234_int64, -89234_int64]
@@ -255,15 +258,11 @@ contains
 
     associate (n_up => walkers%n_spin_up, n_down => walkers%n_spin_down, &
          n_dim => walkers%n_dim, regions => walkers%regions(:, i))
-      if (n_up <= 1) then
-         regions(1) = 1
-      else
+      regions(:) = 0
+      if (n_up > 0) then
          regions(1) = spin_up_region(n_up, n_dim, walkers%x(:, 1:n_up, i))
       end if
-
-      if (n_down <= 1) then
-         regions(2) = 1
-      else
+      if (n_down > 0) then
          regions(2) = spin_down_region(n_down, n_dim, walkers%x(:, n_up+1:, i))
       end if
     end associate
@@ -286,9 +285,7 @@ contains
     real(fp), intent(in):: x(ndim, n)
     real(fp)            :: s
 
-    if (n /= 2 .or. ndim /= 2) error stop "assuming n = 2 and ndim = 2"
-
-    s = x(1, 1) * x(2, 2) - x(1, 2) * x(2, 1)
+    s = x(1, 1)
 
     if (s < 0.0_fp) then
        spin_region_ho_2d = -1
@@ -306,7 +303,8 @@ contains
 
     n = walkers%n
 
-    associate (cdf => walkers%cdf, x_new => walkers%x_new, phi_new => walkers%phi_new)
+    associate (cdf => walkers%cdf, x_new => walkers%x_new, &
+         phi_new => walkers%phi_new, regions_new => walkers%regions_new)
 
       prefix_sum = 0.0
       !$omp parallel do reduction(inscan, +:prefix_sum)
@@ -326,12 +324,14 @@ contains
          j   = upper_bound(cdf, pos)      ! first index with cdf(j) >= pos
          x_new(:, :, i) = walkers%x(:, :, j)
          phi_new(i)  = walkers%phi(j)
+         regions_new(:, i) = walkers%regions(:, j)
       end do
 
       mean_w = sum_w / n
       do i = 1, n
          walkers%x(:, :, i) = x_new(:, :, i)
          walkers%phi(i)  = phi_new(i)
+         walkers%regions(:, i)  = regions_new(:, i)
          walkers%w(i)    = real(mean_w, fp)
       end do
     end associate

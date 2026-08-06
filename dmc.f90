@@ -36,19 +36,20 @@ program qmc
      integer(int64), allocatable :: s(:, :)
   end type walkers_t
 
-  type(cfg_t)           :: cfg
-  type(walkers_t)       :: walkers
-  integer               :: n_steps, max_steps
-  real(dp)              :: dt, time, end_time
-  real(dp)              :: trial_energy
-  real(dp)              :: mean_local_energy
-  real(dp), allocatable :: mean_local_energy_array(:)
-  real(dp)              :: ratio, kappa
-  real(dp)              :: sum_w, n_eff, tmp_float64
-  character(len=40)     :: potential_name
+  type(cfg_t)       :: cfg
+  type(walkers_t)   :: walkers
+  integer           :: n_steps, max_steps
+  real(dp)          :: dt, time, end_time
+  real(dp)          :: trial_energy
+  real(dp)          :: kappa
+  real(dp)          :: sum_w, n_eff, tmp_float64
+  character(len=40) :: potential_name
+  logical           :: mser_done
+
+  real(dp)              :: sum_w_prev, growth_energy
+  real(dp), allocatable :: growth_energy_array(:)
 
   real(fp) :: atom_z
-
   integer  :: batch_size, trunc_obs, status
   real(dp) :: min_mser
   logical, parameter :: correct_autocorr = .true.
@@ -69,7 +70,7 @@ program qmc
        "Time step (atomic units)")
   call cfg_add(cfg, "end_time", 40.0_dp, &
        "End time (atomic units)")
-  call cfg_add(cfg, "num_walkers", 1000, &
+  call cfg_add(cfg, "n_walkers", 1000, &
        "Number of walkers")
   call cfg_add(cfg, "initial_energy", 0.0_dp, &
        "Initial energy estimate (atomic units)")
@@ -81,6 +82,7 @@ program qmc
        "Batch size for estimate of local energy")
 
   call cfg_update_from_arguments(cfg)
+  call cfg_check(cfg)
 
   call cfg_get(cfg, "end_time", end_time)
   call cfg_get(cfg, "dt", dt)
@@ -90,6 +92,7 @@ program qmc
 
   call cfg_get(cfg, "potential", potential_name)
   call cfg_get(cfg, "atom_z", tmp_float64)
+  atom_z = real(tmp_float64, fp)
 
   select case (potential_name)
   case ("atom")
@@ -100,38 +103,49 @@ program qmc
      error stop "Unknown potential type"
   end select
 
-  atom_z = real(tmp_float64, fp)
   max_steps = ceiling(end_time/dt)
 
   call walkers_initialize(cfg, walkers)
 
-  allocate(mean_local_energy_array(max_steps))
+  allocate(growth_energy_array(max_steps))
 
+  mser_done = .false.
   time = 0.0_dp
-  n_steps = 0
-  mean_local_energy = 0.0_dp
+  sum_w_prev = sum(walkers%w)
 
   do n_steps = 1, max_steps
-     call walkers_update(walkers, dt, trial_energy, &
-          mean_local_energy_array(n_steps), sum_w, n_eff)
+     call walkers_update(walkers, dt, trial_energy, sum_w, n_eff)
+
+     growth_energy_array(n_steps) = trial_energy - log(sum_w/sum_w_prev)/dt
+     sum_w_prev = sum_w
+
+     if (mser_done) then
+        growth_energy = growth_energy + &
+             (growth_energy_array(n_steps) - growth_energy) / (n_steps - trunc_obs)
+     end if
 
      if (n_eff < walkers%n_eff_frac * walkers%n) then
         call systematic_resample(walkers, sum_w)
      end if
 
      if (mod(n_steps, max_steps/100) == 0) then
-        call mser_analysis(n_steps, mean_local_energy_array, batch_size, &
-             correct_autocorr, trunc_obs, mean_local_energy, min_mser, status)
-        print *, "AVG", n_steps, time, trunc_obs, mean_local_energy, sqrt(min_mser)
-        print *, trial_energy
+        if (.not. mser_done) then
+           call mser_analysis(n_steps, growth_energy_array, batch_size, &
+                correct_autocorr, trunc_obs, growth_energy, min_mser, status)
+           mser_done = (trunc_obs > 0 .and. trunc_obs < n_steps/10)
+        end if
+
+        print *, mser_done, n_steps, trunc_obs, time, growth_energy
      end if
 
      time = time + dt
-     ratio = sum_w / walkers%n
-     trial_energy = mean_local_energy - 1/(kappa*dt) * log(ratio)
+     trial_energy = growth_energy - log(sum_w/real(walkers%n, dp)) / (kappa*dt)
   end do
 
-  write(*, "(A,E12.4)") "Total updates: ", n_steps * real(walkers%n, dp)
+  call mser_analysis(n_steps-1, growth_energy_array, batch_size, &
+       correct_autocorr, trunc_obs, growth_energy, min_mser, status)
+  write(*, "(A,2F12.5)") " Final result:  ", growth_energy, sqrt(min_mser)
+  write(*, "(A,E12.4)") " Total updates: ", n_steps * real(walkers%n, dp)
 
 contains
 
@@ -142,7 +156,7 @@ contains
     integer                        :: i, n, idim
     integer(int64)                 :: initial_seed(2), rand_int64
 
-    call cfg_get(cfg, "num_walkers", walkers%n)
+    call cfg_get(cfg, "n_walkers", walkers%n)
     call cfg_get(cfg, "n_dim", walkers%n_dim)
     call cfg_get(cfg, "n_particles", walkers%n_particles)
     call cfg_get(cfg, "n_spin_up", walkers%n_spin_up)
@@ -176,7 +190,7 @@ contains
           do n = 1, walkers%n_particles
              do idim = 1, walkers%n_dim
                 call next(walkers%s(1, i), walkers%s(2, i), rand_int64)
-                walkers%x(idim, n, i) = real(uni01_64(rand_int64) - 0.5_dp, fp)
+                walkers%x(idim, n, i) = real(1.0_dp * (uni01_64(rand_int64) - 0.5_dp), fp)
              end do
           end do
        end do
@@ -193,39 +207,30 @@ contains
 
   end subroutine walkers_initialize
 
-  subroutine walkers_update(walkers, dt, trial_energy, local_energy, &
-       sum_w, n_eff)
+  subroutine walkers_update(walkers, dt, trial_energy, sum_w, n_eff)
     type(walkers_t), intent(inout) :: walkers
     real(dp), intent(in)           :: dt, trial_energy
-    real(dp), intent(out)          :: local_energy
     real(dp), intent(out)          :: sum_w
     real(dp), intent(out)          :: n_eff
     integer                        :: i, n, idim, ix, old_regions(2)
     real(fp)                       :: sqrt_dt, phi_avg, exp_arg
-    real(dp)                       :: sum_w2, sum_we
-    real(fp)                       :: rr(walkers%n_particles*walkers%n_dim + 1)
+    real(dp)                       :: sum_w2
+    real(fp)                       :: rr(walkers%n_dim, walkers%n_particles)
 
     sqrt_dt = sqrt(real(dt, fp))
     sum_w  = 0.0_dp
-    sum_we = 0.0_dp
     sum_w2 = 0.0_dp
 
     !$omp parallel do private(phi_avg, n, rr, idim, ix, exp_arg, old_regions) &
-    !$omp &reduction(+: sum_w, sum_we, sum_w2)
+    !$omp &reduction(+: sum_w, sum_w2)
     do i = 1, walkers%n
        phi_avg = walkers%phi(i)
        old_regions = walkers%regions(:, i)
 
-       do n = 1, (walkers%n_particles * walkers%n_dim + 1)/2
-          call box_muller_32(walkers%s(1, i), walkers%s(2, i), rr(2*n-1), rr(2*n))
-       end do
+       call get_normal_numbers(walkers%n_dim, walkers%n_particles, &
+            walkers%s(1, i), walkers%s(2, i), rr)
 
-       do n = 1, walkers%n_particles
-          do idim = 1, walkers%n_dim
-             ix = (n - 1) * walkers%n_dim + idim
-             walkers%x(idim, n, i) = walkers%x(idim, n, i) + sqrt_dt * rr(ix)
-          end do
-       end do
+       walkers%x(:, :, i) = walkers%x(:, :, i) + sqrt_dt * rr
 
        call set_regions(walkers, i)
 
@@ -240,15 +245,13 @@ contains
        phi_avg = 0.5_fp * (phi_avg + walkers%phi(i))
 
        exp_arg = real(-dt * (phi_avg - trial_energy), fp)
-       exp_arg = min(exp_arg, 2.0_fp)
+       exp_arg = min(exp_arg, 5.0_fp)
        walkers%w(i) = walkers%w(i) * exp(exp_arg)
 
        sum_w  = sum_w  + walkers%w(i)
-       sum_we = sum_we + walkers%w(i) * phi_avg
        sum_w2 = sum_w2 + walkers%w(i)**2
     end do
 
-    local_energy = sum_we / sum_w
     n_eff = sum_w**2 / sum_w2
   end subroutine walkers_update
 
@@ -285,7 +288,10 @@ contains
     real(fp), intent(in):: x(ndim, n)
     real(fp)            :: s
 
-    s = x(1, 1)
+    s = 1
+    ! s = x(1, 1)
+    ! s = norm2(x(:, 1))
+    ! s = (s - 0.25_fp) * (s - 0.5_fp)
 
     if (s < 0.0_fp) then
        spin_region_ho_2d = -1
@@ -397,6 +403,19 @@ contains
     end do
   end subroutine compute_potential_harmonic
 
+  subroutine get_normal_numbers(nx, ny, s1, s2, rr)
+    integer, intent(in)           :: nx, ny
+    integer(int64), intent(inout) :: s1, s2
+    real(fp), intent(out)         :: rr(nx, ny)
+    real(fp)                      :: tmp(nx*ny+1)
+    integer                       :: i
+
+    do i = 1, size(tmp)/2
+       call box_muller_32(s1, s2, tmp(2*i-1), tmp(2*i))
+    end do
+    rr = reshape(tmp(1:nx*ny), [nx, ny])
+  end subroutine get_normal_numbers
+
   include 'rng.f90'
 
-end program
+end program qmc

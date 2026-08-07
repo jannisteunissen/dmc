@@ -21,4 +21,7 @@ module m_settings
 #define ATOM_Z 1.0_fp
 #endif
   real(fp), parameter :: atom_z = ATOM_Z
+
+  real(fp) :: sqrt_dt, trial_energy_fp
+
 end module m_settings

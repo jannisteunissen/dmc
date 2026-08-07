@@ -425,13 +425,23 @@ contains
 #elif NPART <= 10
     integer, parameter :: n_up = size(orb_up), n_dn = size(orb_dn)
 
-    ! Zeta values indexed by atomic number (Z = 3..10)
-    real(fp), parameter :: z1_tab(3:10) = &
-      [2.6906_fp, 3.6848_fp, 4.6795_fp, 5.6727_fp, 6.6651_fp, 7.6579_fp, 8.6501_fp, 9.6421_fp]
-    real(fp), parameter :: z2_tab(3:10) = &
-      [1.2792_fp, 1.9120_fp, 2.5762_fp, 3.2166_fp, 3.8340_fp, 4.4531_fp, 5.0743_fp, 5.6982_fp]
-    real(fp), parameter :: z1 = z1_tab(ATOMZ)
-    real(fp), parameter :: z2 = z2_tab(ATOMZ)
+#if   ATOMZ == 3
+    real(fp), parameter :: z1 = 2.6906_fp, z2 = 1.2792_fp
+#elif ATOMZ == 4
+    real(fp), parameter :: z1 = 3.6848_fp, z2 = 1.9120_fp
+#elif ATOMZ == 5
+    real(fp), parameter :: z1 = 4.6795_fp, z2 = 2.5762_fp
+#elif ATOMZ == 6
+    real(fp), parameter :: z1 = 5.6727_fp, z2 = 3.2166_fp
+#elif ATOMZ == 7
+    real(fp), parameter :: z1 = 6.6651_fp, z2 = 3.8340_fp
+#elif ATOMZ == 8
+    real(fp), parameter :: z1 = 7.6579_fp, z2 = 4.4531_fp
+#elif ATOMZ == 9
+    real(fp), parameter :: z1 = 8.6501_fp, z2 = 5.0743_fp
+#elif ATOMZ == 10
+    real(fp), parameter :: z1 = 9.6421_fp, z2 = 5.6982_fp
+#endif
 
     s_up = det_sign(n_up, x(:, 1:n_up),           orb_up, z1, z2)
     s_dn = det_sign(n_dn, x(:, n_up+1:n_up+n_dn), orb_dn, z1, z2)

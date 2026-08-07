@@ -420,6 +420,9 @@ contains
     integer, parameter :: orb_up(*) = [1,2,3,4,5], orb_dn(*) = [1,2,3,4,5]
 #endif
 
+#if NPART < 3
+
+#elif NPART <= 10
     integer, parameter :: n_up = size(orb_up), n_dn = size(orb_dn)
 
     ! Zeta values indexed by atomic number (Z = 3..10)
@@ -434,6 +437,9 @@ contains
     s_dn = det_sign(n_dn, x(:, n_up+1:n_up+n_dn), orb_dn, z1, z2)
 
     r = s_up * s_dn
+#else
+    error stop "Not implemented"
+#endif
   end function nodal_region
 
   ! sign of det of Slater matrix A(i,j) = phi_{orb(j)}(elec i)

@@ -36,12 +36,12 @@ program dmc
   real(dp)              :: kappa
   real(dp)              :: sum_w, n_eff, n_eff_frac, trial_energy
   logical               :: mser_done
-  real(dp)              :: sum_w_prev, growth_energy
+  real(dp)              :: sum_w_prev, growth_energy, clock_count_rate
   real(dp), allocatable :: growth_energy_array(:)
   integer               :: batch_size, trunc_obs, status
   real(dp)              :: min_mser, tmp
   logical, parameter    :: correct_autocorr = .true.
-  integer(int64)        :: s_sequential(2)
+  integer(int64)        :: s_sequential(2), t0, t1
 
   integer :: update_interval
 
@@ -90,6 +90,8 @@ program dmc
   time       = 0.0_dp
   sum_w_prev = sum(walkers%w)
 
+  call system_clock(t0, clock_count_rate)
+
   do i_step = 1, max_steps
 
      call walkers_update(walkers%n, walkers%x, walkers%phi, walkers%w, &
@@ -126,11 +128,14 @@ program dmc
      trial_energy_fp = real(trial_energy, fp)
   end do
 
+  call system_clock(t1)
+
   call mser_analysis(i_step-1, growth_energy_array, batch_size, &
        correct_autocorr, trunc_obs, growth_energy, min_mser, status)
   write(*, "(A,2F12.5)") " Final result:  ", growth_energy, sqrt(min_mser)
-  write(*, "(A,E12.4)") " Total updates: ", max_steps * real(walkers%n, dp) * &
-       update_interval
+  tmp = max_steps * real(walkers%n, dp) * update_interval
+  write(*, "(A,E12.4)") " Total updates: ", tmp
+  write(*, "(A,E12.4)") " Updates/s:    ", tmp * clock_count_rate / (t1 - t0)
 
 contains
 
@@ -235,13 +240,16 @@ contains
           reg_old = reg
 
           do p = 1, n_particles
-             do idim = 1, n_dim, 2
+             do idim = 1, n_dim - 1, 2 ! full pairs
                 call box_muller_32(s1, s2, r1, r2)
-                xl(idim, p) = xl(idim, p) + sqrt_dt*r1
-                if (idim + 1 <= n_dim) then
-                   xl(idim+1, p) = xl(idim+1, p) + sqrt_dt*r2
-                end if
+                xl(idim,   p) = xl(idim,   p) + sqrt_dt*r1
+                xl(idim+1, p) = xl(idim+1, p) + sqrt_dt*r2
              end do
+
+             if (iand(n_dim, 1) == 1) then ! odd n_dim, do last dimension
+                call box_muller_32(s1, s2, r1, r2)
+                xl(n_dim, p) = xl(n_dim, p) + sqrt_dt*r1
+             end if
           end do
 
           reg = spin_region(xl)

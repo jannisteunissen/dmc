@@ -195,7 +195,7 @@ contains
     do i = 1, walkers%n
        call compute_potential(walkers%x(:, :, i), walkers%phi(i))
        walkers%w(i) = 1.0_dp
-       walkers%region(i) = spin_region(walkers%x(:, :, i))
+       walkers%region(i) = nodal_region(walkers%x(:, :, i))
     end do
 
     ! OpenACC: store on device
@@ -250,7 +250,7 @@ contains
              end if
           end do
 
-          ! reg = spin_region(x(:, :, i))
+          reg = nodal_region(x(:, :, i))
           if (reg /= reg_old) wl = 0
 
           call compute_potential(x(:, :, i), phil)
@@ -395,20 +395,164 @@ contains
 #endif
   end subroutine compute_potential
 
-  pure integer function spin_region(x) result(r)
+  ! sign of det of the Slater matrix A(i,j) = phi_{orb(j)}(elec i)
+  pure integer function nodal_region(x) result(r)
     !$acc routine seq
     real(fp), intent(in) :: x(n_dim, n_particles)
-    real(fp)             :: s
+    integer :: s_up, s_dn
 
-#if defined(REGION_HO2D)
-    s = norm2(x(:, 3)) - 2.0_fp/3.0_fp
-#else if defined(REGION_NONE)
-    s = 1.0_fp
-#else if defined(REGION_2PX)
-    s = x(1, 1)
+    ! orbital codes: 1=1s, 2=2s, 3=2px, 4=2py, 5=2pz
+#if NPART == 3
+    integer, parameter :: orb_up(*) = [1,2],       orb_dn(*) = [1]
+#elif NPART == 4
+    integer, parameter :: orb_up(*) = [1,2],       orb_dn(*) = [1,2]
+#elif NPART == 5
+    integer, parameter :: orb_up(*) = [1,2,3],     orb_dn(*) = [1,2]
+#elif NPART == 6
+    integer, parameter :: orb_up(*) = [1,2,3,4],   orb_dn(*) = [1,2]
+#elif NPART == 7
+    integer, parameter :: orb_up(*) = [1,2,3,4,5], orb_dn(*) = [1,2]
+#elif NPART == 8
+    integer, parameter :: orb_up(*) = [1,2,3,4,5], orb_dn(*) = [1,2,3]
+#elif NPART == 9
+    integer, parameter :: orb_up(*) = [1,2,3,4,5], orb_dn(*) = [1,2,3,4]
+#elif NPART == 10
+    integer, parameter :: orb_up(*) = [1,2,3,4,5], orb_dn(*) = [1,2,3,4,5]
 #endif
-    r = merge(1, -1, s >= 0.0_fp)
-  end function spin_region
+
+    integer, parameter :: n_up = size(orb_up), n_dn = size(orb_dn)
+
+    ! Zeta values indexed by atomic number (Z = 3..10)
+    real(fp), parameter :: z1_tab(3:10) = &
+      [2.6906_fp, 3.6848_fp, 4.6795_fp, 5.6727_fp, 6.6651_fp, 7.6579_fp, 8.6501_fp, 9.6421_fp]
+    real(fp), parameter :: z2_tab(3:10) = &
+      [1.2792_fp, 1.9120_fp, 2.5762_fp, 3.2166_fp, 3.8340_fp, 4.4531_fp, 5.0743_fp, 5.6982_fp]
+    real(fp), parameter :: z1 = z1_tab(ATOMZ)
+    real(fp), parameter :: z2 = z2_tab(ATOMZ)
+
+    s_up = det_sign(n_up, x(:, 1:n_up),           orb_up, z1, z2)
+    s_dn = det_sign(n_dn, x(:, n_up+1:n_up+n_dn), orb_dn, z1, z2)
+
+    r = s_up * s_dn
+  end function nodal_region
+
+  ! sign of det of Slater matrix A(i,j) = phi_{orb(j)}(elec i)
+  ! Uses closed-form determinants (n<=5). Only the sign is needed;
+  ! a common positive per-row factor exp(-z2*r/2) is divided out.
+  pure integer function det_sign(n, xe, orb, z1, z2) result(sg)
+    !$acc routine seq
+    integer, intent(in)  :: n
+    real(fp), intent(in) :: xe(n_dim, n)
+    real(fp), intent(in) :: z1 ! 1s exponent
+    real(fp), intent(in) :: z2 ! 2s/2p exponent
+    integer,  intent(in) :: orb(:)
+
+    real(fp)           :: a(n, n)
+    real(fp)           :: rk, ek, det
+    integer            :: i, j
+
+    ! build Slater matrix (per-row positive factor removed)
+    do i = 1, n
+       rk = norm2(xe(:, i))
+       ek = exp(-(z1 - 0.5_fp*z2) * rk)          ! 1s, relative factor
+       do j = 1, n
+          select case (orb(j))
+          case (1); a(i,j) = ek                    ! 1s
+          case (2); a(i,j) = 1.0_fp - 0.5_fp*z2*rk ! 2s
+          case (3); a(i,j) = xe(1, i)              ! 2px
+          case (4); a(i,j) = xe(2, i)              ! 2py
+          case (5); a(i,j) = xe(3, i)              ! 2pz
+          end select
+       end do
+    end do
+
+    ! closed-form determinant by size
+    select case (n)
+    case (1)
+       det = a(1,1)
+    case (2)
+       det = a(1,1)*a(2,2) - a(1,2)*a(2,1)
+    case (3)
+       det = det3(a(1:3,1:3))
+    case (4)
+       det = det4(a(1:4,1:4))
+    case (5)
+       det = det5(a(1:5,1:5))
+    case default
+       det = 0.0_fp
+    end select
+
+    if (det > 0.0_fp) then
+       sg = 1
+    else
+       sg = -1
+    end if
+  end function det_sign
+
+  !----------------------------------------------------------------
+  ! Fixed-size determinant helpers (cofactor expansion)
+  !----------------------------------------------------------------
+  pure real(fp) function det3(m) result(d)
+    !$acc routine seq
+    real(fp), intent(in) :: m(3,3)
+    d = m(1,1)*(m(2,2)*m(3,3) - m(2,3)*m(3,2)) &
+      - m(1,2)*(m(2,1)*m(3,3) - m(2,3)*m(3,1)) &
+      + m(1,3)*(m(2,1)*m(3,2) - m(2,2)*m(3,1))
+  end function det3
+
+  pure real(fp) function minor3(m, rskip, cskip) result(d)
+    !$acc routine seq
+    real(fp), intent(in) :: m(4, 4)
+    integer,  intent(in) :: rskip, cskip
+    real(fp)             :: s(3,3)
+    integer              :: ri, ci, i, j
+    ri = 0
+    do i = 1, size(m,1)
+       if (i == rskip) cycle
+       ri = ri + 1
+       ci = 0
+       do j = 1, size(m,2)
+          if (j == cskip) cycle
+          ci = ci + 1
+          s(ri,ci) = m(i,j)
+       end do
+    end do
+    d = det3(s)
+  end function minor3
+
+  pure real(fp) function det4(m) result(d)
+    !$acc routine seq
+    real(fp), intent(in) :: m(4,4)
+    ! expand along first row
+    d =  m(1,1)*minor3(m,1,1) - m(1,2)*minor3(m,1,2) &
+       + m(1,3)*minor3(m,1,3) - m(1,4)*minor3(m,1,4)
+  end function det4
+
+  pure real(fp) function minor4(m, cskip) result(d)
+    !$acc routine seq
+    real(fp), intent(in) :: m(5,5)
+    integer,  intent(in) :: cskip
+    real(fp) :: s(4,4)
+    integer  :: ci, i, j
+    do i = 1, 4                 ! drop row 1
+       ci = 0
+       do j = 1, 5
+          if (j == cskip) cycle
+          ci = ci + 1
+          s(i,ci) = m(i+1,j)
+       end do
+    end do
+    d = det4(s)
+  end function minor4
+
+  pure real(fp) function det5(m) result(d)
+    !$acc routine seq
+    real(fp), intent(in) :: m(5,5)
+    ! expand along first row
+    d =  m(1,1)*minor4(m,1) - m(1,2)*minor4(m,2) &
+       + m(1,3)*minor4(m,3) - m(1,4)*minor4(m,4) &
+       + m(1,5)*minor4(m,5)
+  end function det5
 
   include 'rng.f90'
 

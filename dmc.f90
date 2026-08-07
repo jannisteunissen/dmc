@@ -30,15 +30,16 @@ program dmc
 
   type(cfg_t)           :: cfg
   type(walkers_t)       :: walkers
-  integer               :: i, n_steps, max_steps, steps_log
+  integer               :: i_step, max_steps, steps_log
   real(dp)              :: dt, dt_step, time, end_time
+  real(fp)              :: dt_fp, sqrt_dt, trial_energy_fp
   real(dp)              :: kappa
   real(dp)              :: sum_w, n_eff, n_eff_frac, trial_energy
   logical               :: mser_done
   real(dp)              :: sum_w_prev, growth_energy
   real(dp), allocatable :: growth_energy_array(:)
   integer               :: batch_size, trunc_obs, status
-  real(dp)              :: min_mser
+  real(dp)              :: min_mser, tmp
   logical, parameter    :: correct_autocorr = .true.
   integer(int64)        :: s_sequential(2)
 
@@ -75,8 +76,9 @@ program dmc
   call cfg_get(cfg, "batch_size", batch_size)
   call cfg_get(cfg, "update_interval", update_interval)
 
-  sqrt_dt = real(sqrt(dt), fp)
-  dt_step = dt * update_interval
+  dt_fp     = real(dt, fp)
+  sqrt_dt   = real(sqrt(dt), fp)
+  dt_step   = dt * update_interval
   max_steps = ceiling(end_time/dt_step)
   steps_log = ceiling(max_steps*1e-2_dp)
 
@@ -88,35 +90,34 @@ program dmc
   time       = 0.0_dp
   sum_w_prev = sum(walkers%w)
 
-  do n_steps = 1, max_steps
+  do i_step = 1, max_steps
 
-     do i = 1, update_interval
-        call walkers_update(walkers, sqrt_dt, trial_energy_fp)
-     end do
+     call walkers_update(walkers%n, walkers%x, walkers%phi, walkers%w, &
+          walkers%region, walkers%s, dt_fp, sqrt_dt, trial_energy_fp, update_interval)
 
-     call get_stats(walkers, sum_w, n_eff)
+     call get_stats(walkers%n, walkers%w, sum_w, n_eff)
 
-     growth_energy_array(n_steps) = trial_energy - log(sum_w/sum_w_prev)/dt_step
+     growth_energy_array(i_step) = trial_energy - log(sum_w/sum_w_prev)/dt_step
      sum_w_prev = sum_w
 
      if (mser_done) then
         growth_energy = growth_energy + &
-             (growth_energy_array(n_steps) - growth_energy) / (n_steps - trunc_obs)
+             (growth_energy_array(i_step) - growth_energy) / (i_step - trunc_obs)
      end if
 
      if (n_eff < n_eff_frac * walkers%n) then
         call systematic_resample(walkers)
      end if
 
-     if (mod(n_steps, steps_log) == 0) then
+     if (mod(i_step, steps_log) == 0) then
         if (.not. mser_done) then
-           call mser_analysis(n_steps, growth_energy_array, batch_size, &
+           call mser_analysis(i_step, growth_energy_array, batch_size, &
                 correct_autocorr, trunc_obs, growth_energy, min_mser, status)
-           mser_done = (trunc_obs > 0 .and. trunc_obs < n_steps/10)
+           mser_done = (trunc_obs > 0 .and. trunc_obs < i_step/10)
         end if
 
         write(*, "(I4,'%',I8,' ',L,I8,F12.6,F12.6)") &
-             ceiling((n_steps*1e2_dp)/max_steps), n_steps, &
+             ceiling((i_step*1e2_dp)/max_steps), i_step, &
              mser_done, trunc_obs, time, growth_energy
      end if
 
@@ -125,10 +126,11 @@ program dmc
      trial_energy_fp = real(trial_energy, fp)
   end do
 
-  call mser_analysis(n_steps-1, growth_energy_array, batch_size, &
+  call mser_analysis(i_step-1, growth_energy_array, batch_size, &
        correct_autocorr, trunc_obs, growth_energy, min_mser, status)
   write(*, "(A,2F12.5)") " Final result:  ", growth_energy, sqrt(min_mser)
-  write(*, "(A,E12.4)") " Total updates: ", n_steps * real(walkers%n, dp)
+  write(*, "(A,E12.4)") " Total updates: ", max_steps * real(walkers%n, dp) * &
+       update_interval
 
 contains
 
@@ -202,62 +204,79 @@ contains
 
   end subroutine walkers_initialize
 
-  subroutine walkers_update(walkers, sqrt_dt, trial_energy)
-    type(walkers_t), intent(inout) :: walkers
-    real(fp), intent(in)           :: sqrt_dt, trial_energy
-    integer                        :: i, n, idim, ix, old_region
-    real(fp)                       :: phi_avg, exp_arg
-    real(fp)                       :: r1, r2
+  subroutine walkers_update(n, x, phi, w, region, s, &
+       dt, sqrt_dt, trial_energy, n_steps)
+    integer, intent(in)           :: n
+    real(fp), intent(inout)       :: x(n_dim, n_particles, n)
+    real(fp), intent(inout)       :: phi(n)
+    real(fp), intent(inout)       :: w(n)
+    integer, intent(inout)        :: region(n)
+    integer(int64), intent(inout) :: s(2, n)
+    integer, intent(in)           :: n_steps
+    real(fp), intent(in)          :: dt, sqrt_dt, trial_energy
+    integer                       :: i, it, idim, p, reg, reg_old
+    integer(int64)                :: s1, s2
+    real(fp)                      :: xl(n_dim, n_particles)
+    real(fp)                      :: phil, wl, phi_old, r1, r2, e
 
-    !$omp parallel do private(phi_avg, n, r1, r2, idim, ix, exp_arg, old_region)
-    !$acc parallel loop private(phi_avg, n, r1, r2, idim, ix, exp_arg, old_region)
-    do i = 1, walkers%n
-       phi_avg = walkers%phi(i)
-       old_region = walkers%region(i)
+    !$acc parallel loop default(present) &
+    !$acc private(xl, s1, s2, phil, wl, phi_old, reg, reg_old, r1, r2, e)
+    do i = 1, n
+       xl   = x(:, :, i)
+       phil = phi(i)
+       wl   = w(i)
+       reg  = region(i)
+       s1   = s(1, i)
+       s2   = s(2, i)
 
-       do n = 1, n_particles
-          do idim = 1, n_dim, 2
-             call box_muller_32(walkers%s(1, i), walkers%s(2, i), r1, r2)
-             walkers%x(idim, n, i) = walkers%x(idim, n, i) + sqrt_dt * r1
-             if (idim + 1 <= n_dim) then
-                walkers%x(idim+1, n, i) = walkers%x(idim+1, n, i) + sqrt_dt * r2
-             end if
+       do it = 1, n_steps
+
+          phi_old = phil
+          reg_old = reg
+
+          do p = 1, n_particles
+             do idim = 1, n_dim, 2
+                call box_muller_32(s1, s2, r1, r2)
+                xl(idim, p) = xl(idim, p) + sqrt_dt*r1
+                if (idim + 1 <= n_dim) then
+                   xl(idim+1, p) = xl(idim+1, p) + sqrt_dt*r2
+                end if
+             end do
           end do
+
+          reg = spin_region(xl)
+          if (reg /= reg_old) wl = 0
+
+          call compute_potential(xl, phil)
+          e  = min(-dt*(0.5_fp*(phi_old + phil) - trial_energy), 3.0_fp)
+          wl = wl * exp(e)
        end do
 
-       walkers%region(i) = spin_region(walkers%x(:, :, i))
-
-       if (walkers%region(i) /= old_region) then
-          ! Kill walker
-          walkers%w(i) = 0
-       else
-          ! Compute new potential
-          call compute_potential(walkers%x(:, :, i), walkers%phi(i))
-       end if
-
-       phi_avg = 0.5_fp * (phi_avg + walkers%phi(i))
-
-       exp_arg = real(-dt * (phi_avg - trial_energy), fp)
-       exp_arg = min(exp_arg, 3.0_fp)
-       walkers%w(i) = walkers%w(i) * exp(exp_arg)
+       x(:, :, i) = xl
+       phi(i)     = phil
+       w(i)       = wl
+       region(i)  = reg
+       s(1, i)    = s1
+       s(2, i)    = s2
     end do
-    !$acc end parallel loop
   end subroutine walkers_update
 
-  subroutine get_stats(walkers, sum_w, n_eff)
-    type(walkers_t), intent(inout) :: walkers
-    real(dp), intent(out)          :: sum_w
-    real(dp), intent(out)          :: n_eff
-    real(dp)                       :: sum_w2
+  subroutine get_stats(n, w, sum_w, n_eff)
+    integer, intent(in)   :: n
+    real(fp), intent(in)  :: w(n)
+    real(dp), intent(out) :: sum_w
+    real(dp), intent(out) :: n_eff
+    real(dp)              :: sum_w2
+    integer               :: i
 
     sum_w  = 0.0_dp
     sum_w2 = 0.0_dp
 
     !$omp parallel do reduction(+: sum_w, sum_w2)
     !$acc parallel loop reduction(+: sum_w, sum_w2) default(present)
-    do i = 1, walkers%n
-       sum_w  = sum_w  + walkers%w(i)
-       sum_w2 = sum_w2 + walkers%w(i)**2
+    do i = 1, n
+       sum_w  = sum_w  + w(i)
+       sum_w2 = sum_w2 + w(i)**2
     end do
     !$acc end parallel loop
 
@@ -284,6 +303,7 @@ contains
 
     !$acc update device(wlk%cdf)
     step = wlk%cdf(n) / n
+    mean_w = step
 
     call next(s_sequential(1), s_sequential(2), rand_int64)
     u0 = uni01_64(rand_int64) * step
@@ -300,8 +320,6 @@ contains
        wlk%region_new(i)  = wlk%region(j)
     end do
     !$acc end parallel loop
-
-    mean_w = step
 
     ! Copy back
     !$omp parallel do

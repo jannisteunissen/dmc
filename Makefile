@@ -15,14 +15,14 @@ TESTS := dmc
 NDIM   ?= 3
 NPART  ?= 1
 POT    ?= ATOM
-ATOM_Z ?= 1
+ATOMZ  ?= 1
 REGION ?= NONE
 
-CPPFLAGS = -DNDIM=$(NDIM) -DNPART=$(NPART) -DPOT_$(POT) -DATOM_Z=$(ATOM_Z) \
+CPPFLAGS = -DNDIM=$(NDIM) -DNPART=$(NPART) -DPOT_$(POT) -DATOMZ=$(ATOMZ) \
 	-DREGION_$(REGION)
 
 # Parameter string used to detect changes
-PARAMS := COMPILER=$(COMPILER) NDIM=$(NDIM) NPART=$(NPART) POT=$(POT) ATOM_Z=$(ATOM_Z) REGION=$(REGION)
+PARAMS := COMPILER=$(COMPILER) NDIM=$(NDIM) NPART=$(NPART) POT=$(POT) ATOMZ=$(ATOMZ) REGION=$(REGION)
 
 .PHONY:	all clean settings force
 
@@ -37,7 +37,7 @@ settings:
 	@echo "NDIM     = $(NDIM)"
 	@echo "NPART    = $(NPART)"
 	@echo "POT      = $(POT)"
-	@echo "ATOM_Z   = $(ATOM_Z)"
+	@echo "ATOMZ    = $(ATOMZ)"
 	@echo "REGION   = $(REGION)"
 	@echo "======================"
 

@@ -17,9 +17,9 @@ module m_settings
   integer, parameter :: n_dim       = NDIM
   integer, parameter :: n_particles = NPART
 
-#ifndef ATOM_Z
-#define ATOM_Z 1.0_fp
+#ifndef ATOMZ
+#define ATOMZ 1.0_fp
 #endif
-  real(fp), parameter :: atom_z = ATOM_Z
+  real(fp), parameter :: atom_z = ATOMZ
 
 end module m_settings

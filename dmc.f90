@@ -221,13 +221,11 @@ contains
     real(fp), intent(in)          :: dt, sqrt_dt, trial_energy
     integer                       :: i, it, idim, p, reg, reg_old
     integer(int64)                :: s1, s2
-    real(fp)                      :: xl(n_dim, n_particles)
     real(fp)                      :: phil, wl, phi_old, r1, r2, e
 
     !$acc parallel loop default(present) &
-    !$acc private(xl, s1, s2, phil, wl, phi_old, reg, reg_old, r1, r2, e)
+    !$acc private(s1, s2, phil, wl, phi_old, reg, reg_old, r1, r2, e)
     do i = 1, n
-       xl   = x(:, :, i)
        phil = phi(i)
        wl   = w(i)
        reg  = region(i)
@@ -242,25 +240,24 @@ contains
           do p = 1, n_particles
              do idim = 1, n_dim - 1, 2 ! full pairs
                 call box_muller_32(s1, s2, r1, r2)
-                xl(idim,   p) = xl(idim,   p) + sqrt_dt*r1
-                xl(idim+1, p) = xl(idim+1, p) + sqrt_dt*r2
+                x(idim,   p, i) = x(idim,   p, i) + sqrt_dt*r1
+                x(idim+1, p, i) = x(idim+1, p, i) + sqrt_dt*r2
              end do
 
              if (iand(n_dim, 1) == 1) then ! odd n_dim, do last dimension
                 call box_muller_32(s1, s2, r1, r2)
-                xl(n_dim, p) = xl(n_dim, p) + sqrt_dt*r1
+                x(n_dim, p, i) = x(n_dim, p, i) + sqrt_dt*r1
              end if
           end do
 
-          reg = spin_region(xl)
+          ! reg = spin_region(x(:, :, i))
           if (reg /= reg_old) wl = 0
 
-          call compute_potential(xl, phil)
+          call compute_potential(x(:, :, i), phil)
           e  = min(-dt*(0.5_fp*(phi_old + phil) - trial_energy), 3.0_fp)
           wl = wl * exp(e)
        end do
 
-       x(:, :, i) = xl
        phi(i)     = phil
        w(i)       = wl
        region(i)  = reg
@@ -363,20 +360,30 @@ contains
     !$acc routine seq
     real(fp), intent(in)  :: x(n_dim, n_particles)
     real(fp), intent(out) :: phi
-    integer               :: n, m
+    integer               :: n, m, k
+    real(fp)              :: d2, dxk
 
     phi = 0.0_fp
 
 #if defined(POT_ATOM)
     ! Electron-nucleus terms
     do n = 1, n_particles
-       phi = phi - atom_z / norm2(x(:, n))
+       d2 = 0.0_fp
+       do k = 1, n_dim
+          d2 = d2 + x(k, n)**2
+       end do
+       phi = phi - atom_z / sqrt(d2)
     end do
 
     ! Electron-electron terms
     do n = 1, n_particles
        do m = n+1, n_particles
-          phi = phi + 1.0_fp / norm2(x(:, n) - x(:, m))
+          d2 = 0.0_fp
+          do k = 1, n_dim
+             dxk = x(k,n) - x(k,m)
+             d2  = d2 + dxk**2
+          end do
+          phi = phi + 1.0_fp / sqrt(d2)
        end do
     end do
 #elif defined(POT_HARMONIC)
@@ -397,6 +404,8 @@ contains
     s = norm2(x(:, 3)) - 2.0_fp/3.0_fp
 #else if defined(REGION_NONE)
     s = 1.0_fp
+#else if defined(REGION_2PX)
+    s = x(1, 1)
 #endif
     r = merge(1, -1, s >= 0.0_fp)
   end function spin_region

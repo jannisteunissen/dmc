@@ -421,7 +421,7 @@ contains
 #endif
 
 #if NPART < 3
-
+    r = 1
 #elif NPART <= 10
     integer, parameter :: n_up = size(orb_up), n_dn = size(orb_dn)
 

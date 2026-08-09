@@ -4,7 +4,11 @@ module m_settings
   implicit none
   public
 
+#ifdef FLOAT_32
   integer, parameter :: fp = real32
+#else
+  integer, parameter :: fp = real64
+#endif
 
   ! Defaults if not set by -D flags
 #ifndef NDIM

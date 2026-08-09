@@ -221,7 +221,7 @@ contains
     real(fp), intent(in)          :: dt, sqrt_dt, trial_energy
     integer                       :: i, it, idim, p, reg, reg_old
     integer(int64)                :: s1, s2
-    real(fp)                      :: phil, wl, phi_old, r1, r2, e
+    real(fp)                      :: phil, wl, phi_old, e, r1, r2
 
     !$acc parallel loop default(present) &
     !$acc private(s1, s2, phil, wl, phi_old, reg, reg_old, r1, r2, e)
@@ -239,13 +239,21 @@ contains
 
           do p = 1, n_particles
              do idim = 1, n_dim - 1, 2 ! full pairs
+#ifdef FLOAT_32
                 call box_muller_32(s1, s2, r1, r2)
+#else
+                call box_muller_64(s1, s2, r1, r2)
+#endif
                 x(idim,   p, i) = x(idim,   p, i) + sqrt_dt*r1
                 x(idim+1, p, i) = x(idim+1, p, i) + sqrt_dt*r2
              end do
 
              if (iand(n_dim, 1) == 1) then ! odd n_dim, do last dimension
+#ifdef FLOAT_32
                 call box_muller_32(s1, s2, r1, r2)
+#else
+                call box_muller_64(s1, s2, r1, r2)
+#endif
                 x(n_dim, p, i) = x(n_dim, p, i) + sqrt_dt*r1
              end if
           end do

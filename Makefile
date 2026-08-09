@@ -16,13 +16,15 @@ NDIM   ?= 3
 NPART  ?= 1
 POT    ?= ATOM
 ATOMZ  ?= 1
-REGION ?= NONE
+FLOAT  ?= 64
+
 
 CPPFLAGS = -DNDIM=$(NDIM) -DNPART=$(NPART) -DPOT_$(POT) -DATOMZ=$(ATOMZ) \
-	-DREGION_$(REGION)
+	-DFLOAT_$(FLOAT)
 
 # Parameter string used to detect changes
-PARAMS := COMPILER=$(COMPILER) NDIM=$(NDIM) NPART=$(NPART) POT=$(POT) ATOMZ=$(ATOMZ) REGION=$(REGION)
+PARAMS := COMPILER=$(COMPILER) NDIM=$(NDIM) NPART=$(NPART) POT=$(POT) \
+	ATOMZ=$(ATOMZ) FLOAT=$(FLOAT)
 
 .PHONY:	all clean settings force
 
@@ -38,7 +40,7 @@ settings:
 	@echo "NPART    = $(NPART)"
 	@echo "POT      = $(POT)"
 	@echo "ATOMZ    = $(ATOMZ)"
-	@echo "REGION   = $(REGION)"
+	@echo "FLOAT    = $(FLOAT)"
 	@echo "======================"
 
 clean:

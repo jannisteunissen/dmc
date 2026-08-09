@@ -463,7 +463,7 @@ contains
     real(fp), intent(in) :: z2 ! 2s/2p exponent
     integer,  intent(in) :: orb(:)
 
-    real(fp)           :: a(n, n)
+    real(fp)           :: a(5, 5)
     real(fp)           :: rk, ek, det
     integer            :: i, j
 

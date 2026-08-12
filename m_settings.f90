@@ -24,6 +24,15 @@ module m_settings
 #ifndef ATOMZ
 #define ATOMZ 1.0_fp
 #endif
-  real(fp), parameter :: atom_z = ATOMZ
+  real(fp) :: atom_z = ATOMZ
+  !$acc declare create (atom_z)
+
+  integer :: orb_up(n_particles)
+  integer :: orb_dn(n_particles)
+  integer :: n_up, n_dn
+  !$acc declare create (orb_up, orb_dn, n_up, n_dn)
+
+  real(fp) :: z1, z2
+  !$acc declare create (z1, z2)
 
 end module m_settings

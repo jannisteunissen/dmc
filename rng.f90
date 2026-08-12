@@ -122,3 +122,65 @@ pure subroutine box_muller_32(s1, s2, z1, z2)
   z1    = r * cos(theta)
   z2    = r * sin(theta)
 end subroutine box_muller_32
+
+pure real(fp) function det3(m) result(d)
+  !$acc routine seq
+  real(fp), intent(in) :: m(3,3)
+  d = m(1,1)*(m(2,2)*m(3,3) - m(2,3)*m(3,2)) &
+       - m(1,2)*(m(2,1)*m(3,3) - m(2,3)*m(3,1)) &
+       + m(1,3)*(m(2,1)*m(3,2) - m(2,2)*m(3,1))
+end function det3
+
+pure real(fp) function minor3(m, rskip, cskip) result(d)
+  !$acc routine seq
+  real(fp), intent(in) :: m(4, 4)
+  integer,  intent(in) :: rskip, cskip
+  real(fp)             :: s(3,3)
+  integer              :: ri, ci, i, j
+  ri = 0
+  do i = 1, size(m,1)
+     if (i == rskip) cycle
+     ri = ri + 1
+     ci = 0
+     do j = 1, size(m,2)
+        if (j == cskip) cycle
+        ci = ci + 1
+        s(ri,ci) = m(i,j)
+     end do
+  end do
+  d = det3(s)
+end function minor3
+
+pure real(fp) function det4(m) result(d)
+  !$acc routine seq
+  real(fp), intent(in) :: m(4,4)
+  ! expand along first row
+  d =  m(1,1)*minor3(m,1,1) - m(1,2)*minor3(m,1,2) &
+       + m(1,3)*minor3(m,1,3) - m(1,4)*minor3(m,1,4)
+end function det4
+
+pure real(fp) function minor4(m, cskip) result(d)
+  !$acc routine seq
+  real(fp), intent(in) :: m(5,5)
+  integer,  intent(in) :: cskip
+  real(fp) :: s(4,4)
+  integer  :: ci, i, j
+  do i = 1, 4                 ! drop row 1
+     ci = 0
+     do j = 1, 5
+        if (j == cskip) cycle
+        ci = ci + 1
+        s(i,ci) = m(i+1,j)
+     end do
+  end do
+  d = det4(s)
+end function minor4
+
+pure real(fp) function det5(m) result(d)
+  !$acc routine seq
+  real(fp), intent(in) :: m(5,5)
+  ! expand along first row
+  d =  m(1,1)*minor4(m,1) - m(1,2)*minor4(m,2) &
+       + m(1,3)*minor4(m,3) - m(1,4)*minor4(m,4) &
+       + m(1,5)*minor4(m,5)
+end function det5

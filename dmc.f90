@@ -28,20 +28,43 @@ program dmc
      integer(int64), allocatable :: s(:, :)
   end type walkers_t
 
+  ! Guesses for orbital parameters
+  ! First index: orbital (1 = 1s, 2 = 2s)
+  ! Second index: atomic number Z
+  real(fp), parameter :: zeta(2, 10) = reshape([ &
+       1.0000_fp, 0.5000_fp, & ! H
+       1.6875_fp, 0.0575_fp, & ! He
+       2.6906_fp, 1.2792_fp, & ! Li
+       3.6848_fp, 1.9120_fp, & ! Be
+       4.6795_fp, 2.5762_fp, & ! B
+       5.6727_fp, 3.2166_fp, & ! C
+       6.6651_fp, 3.8340_fp, & ! N
+       7.6579_fp, 4.4531_fp, & ! O
+       8.6501_fp, 5.0743_fp, & ! F
+       9.6421_fp, 5.6982_fp  & ! Ne
+       ], [2, 10])
+
   type(cfg_t)           :: cfg
   type(walkers_t)       :: walkers
-  integer               :: i_step, max_steps, steps_log
+  integer               :: i, z_int, i_step, max_steps, steps_log
   real(dp)              :: dt, dt_step, time, end_time
   real(fp)              :: dt_fp, sqrt_dt, trial_energy_fp
   real(dp)              :: kappa
-  real(dp)              :: sum_w, n_eff, n_eff_frac, trial_energy
+  real(dp)              :: sum_w, n_eff, n_eff_frac
+  real(dp)              :: trial_energy, local_energy
   logical               :: mser_done
   real(dp)              :: sum_w_prev, growth_energy, clock_count_rate
   real(dp), allocatable :: growth_energy_array(:)
+  real(dp), allocatable :: local_energy_array(:)
   integer               :: batch_size, trunc_obs, status
   real(dp)              :: min_mser, tmp
   logical, parameter    :: correct_autocorr = .true.
   integer(int64)        :: s_sequential(2), t0, t1
+  integer               :: dummy_intvec(0)
+
+  real(dp) :: w_target, w_avg
+  real(dp) :: tau_avg, gamma
+  real(dp) :: corr, corr_max
 
   integer :: update_interval
 
@@ -64,8 +87,61 @@ program dmc
   call cfg_add(cfg, "update_interval", 10, &
        "How often to update trial energy (# steps)")
 
+  call cfg_add(cfg, "Z", 1, "Atom Z number")
+  call cfg_add(cfg, "orb_up", dummy_intvec, &
+       "Spin up orbitals (1=1s, 2=2s, 3=2px, 4=2py, 5=2pz)", &
+       dynamic_size=.true.)
+  call cfg_add(cfg, "orb_dn", dummy_intvec, &
+       "Spin down orbitals (1=1s, 2=2s, 3=2px, 4=2py, 5=2pz)", &
+       dynamic_size=.true.)
+  call cfg_add(cfg, "z1", -1.0_dp, &
+       "Parameter for 1s orbital (< 0 means auto value)")
+  call cfg_add(cfg, "z2", -1.0_dp, &
+       "Parameter for 2s orbital (< 0 means auto value)")
+
   call cfg_update_from_arguments(cfg)
   call cfg_check(cfg)
+
+  call cfg_get_size(cfg, "orb_up", n_up)
+  call cfg_get(cfg, "orb_up", orb_up(1:n_up))
+  call cfg_get_size(cfg, "orb_dn", n_dn)
+  call cfg_get(cfg, "orb_dn", orb_dn(1:n_dn))
+
+  call cfg_get(cfg, "Z", z_int)
+
+  if (z_int < 0) then
+     ! Set z-value automatically from number of orbitals
+     z_int = n_up + n_dn
+  else if (n_up == 0 .and. n_dn == 0) then
+     ! Set orbitals automatically from Z
+     n_up = (z_int+1)/2
+     n_dn = z_int/2
+     do i = 1, n_up
+        orb_up(i) = i
+     end do
+     do i = 1, n_dn
+        orb_dn(i) = i
+     end do
+  end if
+  atom_z = z_int
+  !$acc update device(atom_z)
+
+  call cfg_get(cfg, "z1", tmp)
+  z1 = real(tmp, fp)
+  if (z1 < 0) z1 = zeta(1, z_int)
+  call cfg_get(cfg, "z2", tmp)
+  z2 = real(tmp, fp)
+  if (z2 < 0) z2 = zeta(2, z_int)
+  !$acc update device(z1, z2)
+
+  if (n_up + n_dn /= n_particles) then
+     print *, "n_up = ", n_up, "n_dn = ", n_dn, "n_particles = ", n_particles
+     error stop "n_up + n_dn /= n_particles"
+  end if
+  !$acc update device(n_up, n_dn, orb_up, orb_dn)
+
+  call cfg_get(cfg, "Z", z_int)
+  atom_z = z_int
 
   call cfg_get(cfg, "end_time", end_time)
   call cfg_get(cfg, "dt", dt)
@@ -80,24 +156,56 @@ program dmc
   sqrt_dt   = real(sqrt(dt), fp)
   dt_step   = dt * update_interval
   max_steps = ceiling(end_time/dt_step)
-  steps_log = ceiling(max_steps*1e-2_dp)
+  steps_log = max(1, ceiling(max_steps*1e-2_dp))
+  tau_avg   = 1.0_dp
+  gamma     = dt_step / tau_avg ! tau_avg ~ several autocorrelation times
+  corr_max = 0.5_dp / dt_step        ! max |E_T| shift per unit time
 
   call walkers_initialize(cfg, walkers)
 
-  allocate(growth_energy_array(max_steps))
+  ! Print settings
+  write(*, '(A)') repeat("=", 50)
+  write(*, '(A)') " Diffusion Monte Carlo - Settings"
+  write(*, '(A)') repeat("=", 50)
+  write(*, '(A, F12.6)')   " Atom Z number       : ", atom_z
+  write(*, '(A, I0)')      " Spin up orbitals    : ", n_up
+  if (n_up > 0) write(*, '(A, *(I0, 1X))') "   orb_up            : ", orb_up(1:n_up)
+  write(*, '(A, I0)')      " Spin down orbitals  : ", n_dn
+  if (n_dn > 0) write(*, '(A, *(I0, 1X))') "   orb_dn            : ", orb_dn(1:n_dn)
+  write(*, '(A, I0)')      " Total particles     : ", n_particles
+  write(*, '(A, F12.6)')   " z1 (1s param)       : ", z1
+  write(*, '(A, F12.6)')   " z2 (2s param)       : ", z2
+  write(*, '(A, ES12.4)')  " Time step (dt)      : ", dt
+  write(*, '(A, ES12.4)')  " End time            : ", end_time
+  write(*, '(A, I0)')      " N walkers           : ", walkers%n
+  write(*, '(A, F12.6)')   " Initial energy      : ", trial_energy
+  write(*, '(A, F12.6)')   " kappa               : ", kappa
+  write(*, '(A, F12.6)')   " n_eff_frac          : ", n_eff_frac
+  write(*, '(A, I0)')      " batch_size          : ", batch_size
+  write(*, '(A, I0)')      " update_interval     : ", update_interval
+  write(*, '(A)') repeat("=", 50)
 
-  mser_done  = .false.
-  time       = 0.0_dp
-  sum_w_prev = sum(walkers%w)
+  allocate(growth_energy_array(max_steps))
+  allocate(local_energy_array(max_steps))
+
+  growth_energy = trial_energy
+  local_energy  = trial_energy
+  mser_done     = .false.
+  time          = 0.0_dp
+  w_target      = sum(walkers%w) ! fixed reference
+  sum_w_prev    = w_target
+  w_avg         = w_target       ! running average of total weight
 
   call system_clock(t0, clock_count_rate)
 
   do i_step = 1, max_steps
 
      call walkers_update(walkers%n, walkers%x, walkers%phi, walkers%w, &
-          walkers%region, walkers%s, dt_fp, sqrt_dt, trial_energy_fp, update_interval)
+          walkers%region, walkers%s, dt_fp, sqrt_dt, trial_energy_fp, &
+          update_interval)
 
-     call get_stats(walkers%n, walkers%w, sum_w, n_eff)
+     call get_stats(walkers%n, walkers%w, walkers%phi, &
+          sum_w, n_eff, local_energy_array(i_step))
 
      growth_energy_array(i_step) = trial_energy - log(sum_w/sum_w_prev)/dt_step
      sum_w_prev = sum_w
@@ -105,6 +213,8 @@ program dmc
      if (mser_done) then
         growth_energy = growth_energy + &
              (growth_energy_array(i_step) - growth_energy) / (i_step - trunc_obs)
+        local_energy = local_energy + &
+             (local_energy_array(i_step) - local_energy) / (i_step - trunc_obs)
      end if
 
      if (n_eff < n_eff_frac * walkers%n) then
@@ -117,14 +227,19 @@ program dmc
                 correct_autocorr, trunc_obs, growth_energy, min_mser, status)
            mser_done = (trunc_obs > 0 .and. trunc_obs < i_step/10)
         end if
-
         write(*, "(I4,'%',I8,' ',L,I8,F12.6,F12.6)") &
              ceiling((i_step*1e2_dp)/max_steps), i_step, &
              mser_done, trunc_obs, time, growth_energy
      end if
 
      time = time + dt_step
-     trial_energy = growth_energy - log(sum_w/real(walkers%n, dp)) / (kappa*dt_step)
+
+     ! Exponential moving average of total weight (integral/slow term)
+     w_avg = (1.0_dp - gamma)*w_avg + gamma*sum_w
+
+     corr = -log(w_avg/w_target) / (kappa * dt_step)
+     corr = sign(min(abs(corr), corr_max), corr)
+     trial_energy = growth_energy + corr
      trial_energy_fp = real(trial_energy, fp)
   end do
 
@@ -163,10 +278,10 @@ contains
     call random_seed()
 
     call random_number(r)
-    initial_seed = transfer(r, initial_seed)
+    initial_seed = int(r * real(huge(1_int64), dp), int64)
 
     call random_number(r)
-    s_sequential = transfer(r, initial_seed)
+    s_sequential = int(r * real(huge(1_int64), dp), int64)
 
     walkers%s(:, 1) = initial_seed
 
@@ -274,26 +389,31 @@ contains
     end do
   end subroutine walkers_update
 
-  subroutine get_stats(n, w, sum_w, n_eff)
+  subroutine get_stats(n, w, phi, sum_w, n_eff, E_L)
     integer, intent(in)   :: n
     real(fp), intent(in)  :: w(n)
+    real(fp), intent(in)  :: phi(n)
     real(dp), intent(out) :: sum_w
     real(dp), intent(out) :: n_eff
+    real(dp), intent(out) :: E_L
     real(dp)              :: sum_w2
     integer               :: i
 
     sum_w  = 0.0_dp
     sum_w2 = 0.0_dp
+    E_L = 0.0_dp
 
-    !$omp parallel do reduction(+: sum_w, sum_w2)
-    !$acc parallel loop reduction(+: sum_w, sum_w2) default(present)
+    !$omp parallel do reduction(+: sum_w, sum_w2, E_L)
+    !$acc parallel loop reduction(+: sum_w, sum_w2, E_L) default(present)
     do i = 1, n
        sum_w  = sum_w  + w(i)
        sum_w2 = sum_w2 + w(i)**2
+       E_L = E_L + w(i) * phi(i)
     end do
     !$acc end parallel loop
 
     n_eff = sum_w**2 / sum_w2
+    E_L = E_L/sum_w
   end subroutine get_stats
 
   subroutine systematic_resample(wlk)
@@ -407,57 +527,10 @@ contains
   pure integer function nodal_region(x) result(r)
     !$acc routine seq
     real(fp), intent(in) :: x(n_dim, n_particles)
-    integer :: s_up, s_dn
-
-    ! orbital codes: 1=1s, 2=2s, 3=2px, 4=2py, 5=2pz
-#if NPART == 3
-    integer, parameter :: orb_up(*) = [1,2],       orb_dn(*) = [1]
-#elif NPART == 4
-    integer, parameter :: orb_up(*) = [1,2],       orb_dn(*) = [1,2]
-#elif NPART == 5
-    integer, parameter :: orb_up(*) = [1,2,3],     orb_dn(*) = [1,2]
-#elif NPART == 6
-    integer, parameter :: orb_up(*) = [1,2,3,4],   orb_dn(*) = [1,2]
-#elif NPART == 7
-    integer, parameter :: orb_up(*) = [1,2,3,4,5], orb_dn(*) = [1,2]
-#elif NPART == 8
-    integer, parameter :: orb_up(*) = [1,2,3,4,5], orb_dn(*) = [1,2,3]
-#elif NPART == 9
-    integer, parameter :: orb_up(*) = [1,2,3,4,5], orb_dn(*) = [1,2,3,4]
-#elif NPART == 10
-    integer, parameter :: orb_up(*) = [1,2,3,4,5], orb_dn(*) = [1,2,3,4,5]
-#endif
-
-#if NPART < 3
-    r = 1
-#elif NPART <= 10
-    integer, parameter :: n_up = size(orb_up), n_dn = size(orb_dn)
-
-#if   ATOMZ == 3
-    real(fp), parameter :: z1 = 2.6906_fp, z2 = 1.2792_fp
-#elif ATOMZ == 4
-    real(fp), parameter :: z1 = 3.6848_fp, z2 = 1.9120_fp
-#elif ATOMZ == 5
-    real(fp), parameter :: z1 = 4.6795_fp, z2 = 2.5762_fp
-#elif ATOMZ == 6
-    real(fp), parameter :: z1 = 5.6727_fp, z2 = 3.2166_fp
-#elif ATOMZ == 7
-    real(fp), parameter :: z1 = 6.6651_fp, z2 = 3.8340_fp
-#elif ATOMZ == 8
-    real(fp), parameter :: z1 = 7.6579_fp, z2 = 4.4531_fp
-#elif ATOMZ == 9
-    real(fp), parameter :: z1 = 8.6501_fp, z2 = 5.0743_fp
-#elif ATOMZ == 10
-    real(fp), parameter :: z1 = 9.6421_fp, z2 = 5.6982_fp
-#endif
-
-    s_up = det_sign(n_up, x(:, 1:n_up),           orb_up, z1, z2)
-    s_dn = det_sign(n_dn, x(:, n_up+1:n_up+n_dn), orb_dn, z1, z2)
-
+    integer              :: s_up, s_dn
+    s_up = det_sign(n_up, x(:, 1:n_up),           orb_up(1:n_up), z1, z2)
+    s_dn = det_sign(n_dn, x(:, n_up+1:n_up+n_dn), orb_dn(1:n_dn), z1, z2)
     r = s_up * s_dn
-#else
-    error stop "Not implemented"
-#endif
   end function nodal_region
 
   ! sign of det of Slater matrix A(i,j) = phi_{orb(j)}(elec i)
@@ -472,20 +545,26 @@ contains
     integer,  intent(in) :: orb(:)
 
     real(fp)           :: a(5, 5)
-    real(fp)           :: rk, ek, det
+    real(fp)           :: r, x(n_dim), det
     integer            :: i, j
+
+    if (n == 0) then
+       sg = 1
+       return
+    end if
 
     ! build Slater matrix (per-row positive factor removed)
     do i = 1, n
-       rk = norm2(xe(:, i))
-       ek = exp(-(z1 - 0.5_fp*z2) * rk)          ! 1s, relative factor
+       x = xe(:, i)
+       r = norm2(x)
+
        do j = 1, n
           select case (orb(j))
-          case (1); a(i,j) = ek                    ! 1s
-          case (2); a(i,j) = 1.0_fp - 0.5_fp*z2*rk ! 2s
-          case (3); a(i,j) = xe(1, i)              ! 2px
-          case (4); a(i,j) = xe(2, i)              ! 2py
-          case (5); a(i,j) = xe(3, i)              ! 2pz
+          case (1); a(i,j) = exp(-(z1 - 0.5_fp*z2) * r) ! 1s
+          case (2); a(i,j) = 1.0_fp - 0.5_fp*z2*r ! 2s
+          case (3); a(i,j) = x(1)              ! 2px
+          case (4); a(i,j) = x(2)              ! 2py
+          case (5); a(i,j) = x(3)              ! 2pz
           end select
        end do
     end do
@@ -503,7 +582,7 @@ contains
     case (5)
        det = det5(a(1:5,1:5))
     case default
-       det = 0.0_fp
+       det = 1.0_fp
     end select
 
     if (det > 0.0_fp) then
@@ -513,71 +592,6 @@ contains
     end if
   end function det_sign
 
-  !----------------------------------------------------------------
-  ! Fixed-size determinant helpers (cofactor expansion)
-  !----------------------------------------------------------------
-  pure real(fp) function det3(m) result(d)
-    !$acc routine seq
-    real(fp), intent(in) :: m(3,3)
-    d = m(1,1)*(m(2,2)*m(3,3) - m(2,3)*m(3,2)) &
-      - m(1,2)*(m(2,1)*m(3,3) - m(2,3)*m(3,1)) &
-      + m(1,3)*(m(2,1)*m(3,2) - m(2,2)*m(3,1))
-  end function det3
-
-  pure real(fp) function minor3(m, rskip, cskip) result(d)
-    !$acc routine seq
-    real(fp), intent(in) :: m(4, 4)
-    integer,  intent(in) :: rskip, cskip
-    real(fp)             :: s(3,3)
-    integer              :: ri, ci, i, j
-    ri = 0
-    do i = 1, size(m,1)
-       if (i == rskip) cycle
-       ri = ri + 1
-       ci = 0
-       do j = 1, size(m,2)
-          if (j == cskip) cycle
-          ci = ci + 1
-          s(ri,ci) = m(i,j)
-       end do
-    end do
-    d = det3(s)
-  end function minor3
-
-  pure real(fp) function det4(m) result(d)
-    !$acc routine seq
-    real(fp), intent(in) :: m(4,4)
-    ! expand along first row
-    d =  m(1,1)*minor3(m,1,1) - m(1,2)*minor3(m,1,2) &
-       + m(1,3)*minor3(m,1,3) - m(1,4)*minor3(m,1,4)
-  end function det4
-
-  pure real(fp) function minor4(m, cskip) result(d)
-    !$acc routine seq
-    real(fp), intent(in) :: m(5,5)
-    integer,  intent(in) :: cskip
-    real(fp) :: s(4,4)
-    integer  :: ci, i, j
-    do i = 1, 4                 ! drop row 1
-       ci = 0
-       do j = 1, 5
-          if (j == cskip) cycle
-          ci = ci + 1
-          s(i,ci) = m(i+1,j)
-       end do
-    end do
-    d = det4(s)
-  end function minor4
-
-  pure real(fp) function det5(m) result(d)
-    !$acc routine seq
-    real(fp), intent(in) :: m(5,5)
-    ! expand along first row
-    d =  m(1,1)*minor4(m,1) - m(1,2)*minor4(m,2) &
-       + m(1,3)*minor4(m,3) - m(1,4)*minor4(m,4) &
-       + m(1,5)*minor4(m,5)
-  end function det5
-
   include 'rng.f90'
 
-end program dmc
+end program

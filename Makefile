@@ -44,7 +44,7 @@ settings:
 	@echo "======================"
 
 clean:
-	$(RM) $(TESTS) $(OBJS) $(OBJS:.o=.mod) .params
+	$(RM) $(TESTS) *.o .params
 
 # Rewrite .params only if the parameters changed
 .params: force
@@ -52,6 +52,7 @@ clean:
 
 # Dependency information
 $(TESTS): $(OBJS)
+dmc.o: $(OBJS)
 
 # Rebuild all objects when parameters change
 $(OBJS): .params

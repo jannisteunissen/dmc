@@ -157,9 +157,9 @@ program dmc
   dt_step   = dt * update_interval
   max_steps = ceiling(end_time/dt_step)
   steps_log = max(1, ceiling(max_steps*1e-2_dp))
-  tau_avg   = 1.0_dp
+  tau_avg   = 0.1_dp
   gamma     = dt_step / tau_avg ! tau_avg ~ several autocorrelation times
-  corr_max = 0.5_dp / dt_step        ! max |E_T| shift per unit time
+  corr_max  = 10_dp / dt_step        ! max |E_T| shift per unit time
 
   call walkers_initialize(cfg, walkers)
 
@@ -490,6 +490,7 @@ contains
     real(fp), intent(out) :: phi
     integer               :: n, m, k
     real(fp)              :: d2, dxk
+    real(fp), parameter   :: eps2 = 1.0e-12_fp   ! softening
 
     phi = 0.0_fp
 
@@ -500,7 +501,7 @@ contains
        do k = 1, n_dim
           d2 = d2 + x(k, n)**2
        end do
-       phi = phi - atom_z / sqrt(d2)
+       phi = phi - atom_z / sqrt(d2 + eps2)
     end do
 
     ! Electron-electron terms
@@ -511,7 +512,7 @@ contains
              dxk = x(k,n) - x(k,m)
              d2  = d2 + dxk**2
           end do
-          phi = phi + 1.0_fp / sqrt(d2)
+          phi = phi + 1.0_fp / sqrt(d2 + eps2)
        end do
     end do
 #elif defined(POT_HARMONIC)
@@ -595,3 +596,4 @@ contains
   include 'rng.f90'
 
 end program
+
